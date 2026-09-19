@@ -1,3 +1,4 @@
+```yaml
 name: Build Sri Bhoovalaya APK
 
 on:
@@ -9,27 +10,34 @@ on:
 
 jobs:
   build-apk:
-
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Build Flet APK
-        id: build
-        uses: flet-dev/flet-build-action@v1
-        with:
-          target: apk
-          runner-python-version: "3.14"
-          bundled-python-version: "3.14"
-          build-number: ${{ github.run_number }}
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build Android APK
+        run: |
+          uv run flet build apk \
+            --python-version 3.14 \
+            --arch arm64-v8a \
+            --build-number ${{ github.run_number }} \
+            --yes \
+            --verbose
+
+      - name: Find APK
+        run: |
+          echo "APK files found:"
+          find build -type f \( -name "*.apk" -o -name "*.aab" \) -print
 
       - name: Upload APK
         uses: actions/upload-artifact@v7
         with:
           name: sri-bhoovalaya-apk
-          path: ${{ steps.build.outputs.archive-path }}
-          archive: false
+          path: build/**/*.apk
           if-no-files-found: error
+          overwrite: true
+```
