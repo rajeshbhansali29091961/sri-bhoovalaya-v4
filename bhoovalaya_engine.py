@@ -1,5 +1,10 @@
 from datetime import datetime, timedelta
+import json
 import math
+import ssl
+import time
+import urllib.parse
+import urllib.request
 
 
 # ============================================================
@@ -677,7 +682,7 @@ def run_backtest(
 # MAIN ANALYSIS
 # ============================================================
 
-def analyze_stock(
+def analyze_stock_data(
     hindi_name,
     data,
 ):
@@ -717,17 +722,22 @@ def analyze_stock(
         )
 
     # Previous 9 sessions
-    previous = data[-10:-1]
-
+    # (the oldest of the 9 is compared with the session before it,
+    # when that session exists, so it gets a real direction too)
     previous_rows = []
 
-    for i, item in enumerate(previous):
+    start_idx = max(len(data) - 10, 0)
+    end_idx = len(data) - 1
+
+    for idx in range(start_idx, end_idx):
+
+        item = data[idx]
 
         direction = "FLAT"
 
-        if i > 0:
+        if idx > 0:
             direction = price_direction(
-                previous[i - 1]["close"],
+                data[idx - 1]["close"],
                 item["close"],
             )
 
@@ -739,6 +749,8 @@ def analyze_stock(
                     2,
                 ),
                 "direction": direction,
+                # main.py reads the "actual" key
+                "actual": direction,
             }
         )
 
@@ -785,9 +797,248 @@ def analyze_stock(
         "bandhas": bandhas,
         "previous": previous_rows,
         "future": future,
+        # Names expected by main.py
+        "previous_9": previous_rows,
+        "next_9": future,
         "backtest": backtest,
         "accuracy": accuracy,
         "reference_date": str(
             reference["date"]
         ),
     }
+
+
+# ============================================================
+# LIVE PRICE HISTORY
+#
+# Uses only the Python standard library (urllib), so nothing
+# extra has to be compiled into the Android APK.
+# ============================================================
+
+YAHOO_CHART_URL = (
+    "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+)
+
+# 10 sessions are needed for the "previous 9" table,
+# a few more give the backtest something to work with.
+MIN_DAYS = 12
+MAX_DAYS = 730
+
+
+def _ssl_context():
+    """
+    Android often has no system CA bundle that Python can see.
+    Use certifi when it is bundled, otherwise the default context.
+    """
+
+    try:
+        import certifi
+
+        return ssl.create_default_context(
+            cafile=certifi.where()
+        )
+
+    except Exception:
+        return ssl.create_default_context()
+
+
+def parse_yahoo_chart(payload):
+    """
+    Converts Yahoo chart JSON into
+    [{"date": datetime.date, "close": float}, ...]
+    ordered oldest -> newest.
+    """
+
+    chart = (payload or {}).get("chart") or {}
+
+    error = chart.get("error")
+
+    if error:
+        raise ValueError(
+            "Yahoo Finance error: "
+            + str(
+                error.get("description")
+                or error
+            )
+        )
+
+    results = chart.get("result") or []
+
+    if not results:
+        raise ValueError(
+            "No price data returned for this symbol."
+        )
+
+    result = results[0]
+
+    timestamps = result.get("timestamp") or []
+
+    quote_list = (
+        (result.get("indicators") or {}).get("quote")
+        or [{}]
+    )
+
+    closes = quote_list[0].get("close") or []
+
+    # Exchange offset from UTC in seconds (IST = 19800).
+    offset = (
+        (result.get("meta") or {}).get("gmtoffset")
+        or 19800
+    )
+
+    epoch = datetime(1970, 1, 1)
+
+    by_date = {}
+
+    for ts, close in zip(timestamps, closes):
+
+        if close is None:
+            continue
+
+        local = epoch + timedelta(
+            seconds=int(ts) + int(offset)
+        )
+
+        by_date[local.date()] = float(close)
+
+    return [
+        {"date": d, "close": by_date[d]}
+        for d in sorted(by_date)
+    ]
+
+
+def fetch_price_history(
+    symbol,
+    days=60,
+    timezone_name="Asia/Kolkata",
+):
+    """
+    Downloads about `days` daily closes for `symbol`
+    (for example "RELIANCE.NS").
+
+    timezone_name is accepted for the caller's benefit; the
+    exchange's own UTC offset from Yahoo is used for dates.
+    """
+
+    symbol = (symbol or "").strip()
+
+    if not symbol:
+        raise ValueError("Stock symbol is empty.")
+
+    try:
+        days = int(days)
+    except Exception:
+        days = 60
+
+    days = max(MIN_DAYS, min(days, MAX_DAYS))
+
+    now = int(time.time())
+
+    # Calendar days needed to cover `days` trading sessions.
+    span = int(days * 7 / 5) + 12
+
+    query = urllib.parse.urlencode(
+        {
+            "period1": now - span * 86400,
+            "period2": now,
+            "interval": "1d",
+            "events": "history",
+        }
+    )
+
+    url = (
+        YAHOO_CHART_URL.format(
+            symbol=urllib.parse.quote(symbol)
+        )
+        + "?"
+        + query
+    )
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 13) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0 Mobile Safari/537.36"
+            ),
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=20,
+            context=_ssl_context(),
+        ) as response:
+            payload = json.loads(
+                response.read().decode("utf-8")
+            )
+
+    except Exception as ex:
+        raise ValueError(
+            f"Could not download price data for "
+            f"{symbol}: {ex}"
+        )
+
+    rows = parse_yahoo_chart(payload)[-days:]
+
+    if len(rows) < MIN_DAYS:
+        raise ValueError(
+            f"Only {len(rows)} price rows found for "
+            f"{symbol}; at least {MIN_DAYS} are needed."
+        )
+
+    return rows
+
+
+# ============================================================
+# PUBLIC ENTRY POINT USED BY main.py
+# ============================================================
+
+def analyze_stock(
+    symbol,
+    hindi_name=None,
+    days=60,
+    timezone_name="Asia/Kolkata",
+    data=None,
+):
+    """
+    analyze_stock(symbol, hindi_name, days=60, timezone_name=...)
+
+    Downloads the price history for `symbol`, then runs the
+    experimental Bandha analysis on it.
+
+    Pass `data` (a list of {"date": date, "close": float}) to
+    skip the download, e.g. for offline tests.
+    """
+
+    # Old call style: analyze_stock(hindi_name, data)
+    if data is None and isinstance(
+        hindi_name,
+        (list, tuple),
+    ):
+        return analyze_stock_data(
+            symbol,
+            list(hindi_name),
+        )
+
+    if data is None:
+        data = fetch_price_history(
+            symbol,
+            days,
+            timezone_name,
+        )
+
+    result = analyze_stock_data(
+        hindi_name or "",
+        data,
+    )
+
+    result["symbol"] = symbol
+    result["days"] = days
+    result["timezone"] = timezone_name
+    result["data_points"] = len(data)
+
+    return result
