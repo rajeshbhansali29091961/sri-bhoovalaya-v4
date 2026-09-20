@@ -270,7 +270,7 @@ def _request_history(host, symbol, days):
     url = (
         "https://"
         + host
-        + YAHOO_CHART_PATH.format(encoded_symbol)
+        + YAHOO_CHART_PATH.format(symbol=encoded_symbol)
         + "?"
         + params
     )
