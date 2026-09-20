@@ -1,8 +1,11 @@
 from datetime import datetime, timedelta
 import json
 import math
+import os
 import ssl
+import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -815,9 +818,23 @@ def analyze_stock_data(
 # extra has to be compiled into the Android APK.
 # ============================================================
 
-YAHOO_CHART_URL = (
-    "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+YAHOO_HOSTS = (
+    "query1.finance.yahoo.com",
+    "query2.finance.yahoo.com",
 )
+
+YAHOO_CHART_PATH = "/v8/finance/chart/{symbol}"
+
+# HTTP codes worth retrying (rate limit / temporary server trouble)
+RETRY_CODES = (429, 500, 502, 503, 504)
+
+# Number of full passes over the hosts, and the pause between them.
+FETCH_ROUNDS = 3
+RETRY_PAUSE_SECONDS = 2.0
+
+# A cached download younger than this is reused without touching
+# the network, so repeated taps on RUN TEST cannot trigger 429.
+CACHE_FRESH_SECONDS = 2 * 3600
 
 # 10 sessions are needed for the "previous 9" table,
 # a few more give the backtest something to work with.
@@ -907,14 +924,206 @@ def parse_yahoo_chart(payload):
     ]
 
 
-def fetch_price_history(
+def _cache_path(symbol, days):
+    """
+    Cache file location. Flet sets FLET_APP_STORAGE_DATA on
+    Android/iOS; anywhere else fall back to the temp folder.
+    """
+
+    base = (
+        os.environ.get("FLET_APP_STORAGE_DATA")
+        or tempfile.gettempdir()
+    )
+
+    safe = "".join(
+        ch if ch.isalnum() else "_"
+        for ch in symbol
+    )
+
+    return os.path.join(
+        base,
+        f"bhoovalaya_prices_{safe}_{days}.json",
+    )
+
+
+def _cache_load(path):
+    """Returns (rows, age_seconds) or None."""
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            blob = json.load(f)
+
+        rows = [
+            {
+                "date": datetime.strptime(
+                    d, "%Y-%m-%d"
+                ).date(),
+                "close": float(c),
+            }
+            for d, c in blob["rows"]
+        ]
+
+        age = time.time() - float(blob["saved_at"])
+
+        if rows:
+            return rows, age
+
+    except Exception:
+        pass
+
+    return None
+
+
+def _cache_save(path, rows):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "saved_at": time.time(),
+                    "rows": [
+                        [str(r["date"]), r["close"]]
+                        for r in rows
+                    ],
+                },
+                f,
+            )
+    except Exception:
+        # Caching is a convenience; never fail because of it.
+        pass
+
+
+def _request_history(host, symbol, days):
+    """One HTTP request to one Yahoo host. Returns parsed rows."""
+
+    now = int(time.time())
+
+    # Calendar days needed to cover `days` trading sessions.
+    span = int(days * 7 / 5) + 12
+
+    query = urllib.parse.urlencode(
+        {
+            "period1": now - span * 86400,
+            "period2": now,
+            "interval": "1d",
+            "events": "history",
+        }
+    )
+
+    url = (
+        "https://"
+        + host
+        + YAHOO_CHART_PATH.format(
+            symbol=urllib.parse.quote(symbol)
+        )
+        + "?"
+        + query
+    )
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Mobile Safari/537.36"
+            ),
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://finance.yahoo.com/",
+        },
+    )
+
+    with urllib.request.urlopen(
+        request,
+        timeout=12,
+        context=_ssl_context(),
+    ) as response:
+        payload = json.loads(
+            response.read().decode("utf-8")
+        )
+
+    return parse_yahoo_chart(payload)
+
+
+def _download_history(symbol, days):
+    """
+    Tries both Yahoo hosts, several rounds, pausing between
+    rounds. Raises ValueError with a readable message on failure.
+    """
+
+    last_error = "unknown error"
+
+    for round_no in range(FETCH_ROUNDS):
+
+        retryable = False
+
+        for host in YAHOO_HOSTS:
+
+            try:
+                return _request_history(
+                    host,
+                    symbol,
+                    days,
+                )
+
+            except urllib.error.HTTPError as ex:
+
+                last_error = f"HTTP Error {ex.code}: {ex.reason}"
+
+                if ex.code in RETRY_CODES:
+                    retryable = True
+                    continue
+
+                # e.g. 404 for an unknown symbol: Yahoo puts the
+                # reason in the JSON body, so show that if present.
+                try:
+                    parse_yahoo_chart(
+                        json.loads(
+                            ex.read().decode("utf-8")
+                        )
+                    )
+                except ValueError as parsed:
+                    raise parsed
+                except Exception:
+                    pass
+
+                raise ValueError(last_error)
+
+            except json.JSONDecodeError as ex:
+                # Non-JSON reply (throttle page etc.) - retry.
+                last_error = f"unreadable reply ({ex})"
+                retryable = True
+
+            except ValueError:
+                # Yahoo answered but with an error / no data.
+                raise
+
+            except Exception as ex:
+                # Timeouts, DNS, SSL and so on - worth another try.
+                last_error = str(ex)
+                retryable = True
+
+        if not retryable:
+            break
+
+        if round_no < FETCH_ROUNDS - 1:
+            time.sleep(
+                RETRY_PAUSE_SECONDS * (round_no + 1)
+            )
+
+    raise ValueError(last_error)
+
+
+def fetch_price_history_ex(
     symbol,
     days=60,
     timezone_name="Asia/Kolkata",
 ):
     """
-    Downloads about `days` daily closes for `symbol`
-    (for example "RELIANCE.NS").
+    Returns (rows, source) where source is one of:
+      "live"   - freshly downloaded
+      "cache"  - recent download reused (no network call)
+      "stale"  - download failed; older saved data was used
 
     timezone_name is accepted for the caller's benefit; the
     exchange's own UTC offset from Yahoo is used for dates.
@@ -932,65 +1141,49 @@ def fetch_price_history(
 
     days = max(MIN_DAYS, min(days, MAX_DAYS))
 
-    now = int(time.time())
+    path = _cache_path(symbol, days)
 
-    # Calendar days needed to cover `days` trading sessions.
-    span = int(days * 7 / 5) + 12
+    cached = _cache_load(path)
 
-    query = urllib.parse.urlencode(
-        {
-            "period1": now - span * 86400,
-            "period2": now,
-            "interval": "1d",
-            "events": "history",
-        }
-    )
-
-    url = (
-        YAHOO_CHART_URL.format(
-            symbol=urllib.parse.quote(symbol)
-        )
-        + "?"
-        + query
-    )
-
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Linux; Android 13) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0 Mobile Safari/537.36"
-            ),
-            "Accept": "application/json",
-        },
-    )
+    if cached and cached[1] < CACHE_FRESH_SECONDS:
+        return cached[0], "cache"
 
     try:
-        with urllib.request.urlopen(
-            request,
-            timeout=20,
-            context=_ssl_context(),
-        ) as response:
-            payload = json.loads(
-                response.read().decode("utf-8")
+        rows = _download_history(symbol, days)[-days:]
+
+        if len(rows) < MIN_DAYS:
+            raise ValueError(
+                f"Only {len(rows)} price rows found for "
+                f"{symbol}; at least {MIN_DAYS} are needed."
             )
 
-    except Exception as ex:
+    except ValueError as ex:
+
+        if cached:
+            return cached[0], "stale"
+
         raise ValueError(
             f"Could not download price data for "
             f"{symbol}: {ex}"
         )
 
-    rows = parse_yahoo_chart(payload)[-days:]
+    _cache_save(path, rows)
 
-    if len(rows) < MIN_DAYS:
-        raise ValueError(
-            f"Only {len(rows)} price rows found for "
-            f"{symbol}; at least {MIN_DAYS} are needed."
-        )
+    return rows, "live"
 
-    return rows
+
+def fetch_price_history(
+    symbol,
+    days=60,
+    timezone_name="Asia/Kolkata",
+):
+    """Same as fetch_price_history_ex but returns only the rows."""
+
+    return fetch_price_history_ex(
+        symbol,
+        days,
+        timezone_name,
+    )[0]
 
 
 # ============================================================
@@ -1024,8 +1217,10 @@ def analyze_stock(
             list(hindi_name),
         )
 
+    source = "supplied"
+
     if data is None:
-        data = fetch_price_history(
+        data, source = fetch_price_history_ex(
             symbol,
             days,
             timezone_name,
@@ -1040,5 +1235,6 @@ def analyze_stock(
     result["days"] = days
     result["timezone"] = timezone_name
     result["data_points"] = len(data)
+    result["data_source"] = source
 
     return result
