@@ -1,5 +1,4 @@
-et data · PY
-"""
+
 market_data.py - NSE India price history for Sri Bhoovalaya.
  
     NSE India  ->  CSV file on the device  ->  list of daily closes
