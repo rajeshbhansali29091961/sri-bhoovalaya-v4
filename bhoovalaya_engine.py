@@ -1,7 +1,11 @@
-from datetime import datetime, timedelta
-import json
+from datetime import datetime, timedelta, timezone
+import csv
+import gzip
+import http.cookiejar
+import io
 import math
 import os
+import re
 import ssl
 import tempfile
 import time
@@ -812,17 +816,572 @@ def analyze_stock_data(
 
 
 # ============================================================
-# LIVE PRICE HISTORY
-# ============================================================
+# NSE INDIA PRICE HISTORY  (official exchange data, saved as CSV)
 #
-# Price downloading/cache is maintained in market_data.py.
-# Keeping it there prevents two independent Yahoo downloaders
-# from running inside the APK.
+# Flow:  NSE India  ->  CSV file on the phone  ->  analysis
 #
-# The calculation/Bandha code above is intentionally unchanged.
+# 1. nselib is used first when it is installed in the app.
+# 2. If nselib is missing or fails, the SAME NSE report
+#    (generateSecurityWiseHistoricalData, csv=true) is
+#    downloaded directly with the standard library only.
+# 3. The downloaded CSV is kept in the app's storage folder and
+#    reused for a while, so repeated taps do not hit NSE again.
+#
+# Yahoo Finance is no longer used anywhere.
 # ============================================================
 
-from market_data import fetch_price_history_ex
+# Set to False to skip nselib and always use the direct download.
+USE_NSELIB = True
+
+NSE_ORIGIN_URL = "https://www.nseindia.com/report-detail/eq_security"
+
+NSE_API_URL = (
+    "https://www.nseindia.com/api/historicalOR/"
+    "generateSecurityWiseHistoricalData?"
+)
+
+# Same browser-like headers nselib sends (Accept-Encoding limited
+# to gzip, which is the only compression handled below).
+NSE_PAGE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+    "Accept-Encoding": "gzip",
+}
+
+NSE_API_HEADERS = {
+    "User-Agent": NSE_PAGE_HEADERS["User-Agent"],
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+    "Accept-Encoding": "gzip",
+    "Referer": "https://www.nseindia.com/",
+    "Connection": "keep-alive",
+}
+
+DMY = "%d-%m-%Y"
+
+# NSE allows at most one year per request.
+NSE_MAX_CHUNK_DAYS = 364
+
+# 10 sessions are needed for the "previous 9" table,
+# a few more give the backtest something to work with.
+MIN_DAYS = 12
+MAX_DAYS = 730
+
+# A CSV downloaded less than this long ago is reused as it is.
+CACHE_FRESH_SECONDS = 2 * 3600
+
+# Download attempts, and the pause between them.
+FETCH_ATTEMPTS = 3
+RETRY_PAUSE_SECONDS = 2.0
+
+RETRY_CODES = (401, 403, 429, 500, 502, 503, 504)
+
+_DATE_FORMATS = (
+    "%d-%b-%Y",
+    "%d-%B-%Y",
+    "%d-%m-%Y",
+    "%Y-%m-%d",
+    "%d/%m/%Y",
+)
+
+
+# ------------------------------------------------------------
+# symbol / dates
+# ------------------------------------------------------------
+
+def normalize_nse_symbol(symbol):
+    """
+    "RELIANCE.NS" / "reliance" / "NSE:RELIANCE"  ->  "RELIANCE"
+    """
+
+    s = (symbol or "").strip().upper()
+
+    if s.startswith("NSE:"):
+        s = s[4:]
+
+    if s.endswith(".BO") or s.endswith(".BSE"):
+        raise ValueError(
+            "BSE symbols are not supported - NSE data only. "
+            "Use the NSE symbol, for example RELIANCE."
+        )
+
+    if s.endswith(".NS"):
+        s = s[:-3]
+
+    if not s:
+        raise ValueError("Stock symbol is empty.")
+
+    if not re.fullmatch(r"[A-Z0-9&_\-]+", s):
+        raise ValueError(
+            f"'{s}' is not a valid NSE symbol."
+        )
+
+    return s
+
+
+def _india_today():
+    """Today's date in IST (UTC+5:30), no timezone database needed."""
+
+    return (
+        datetime.now(timezone.utc)
+        + timedelta(hours=5, minutes=30)
+    ).date()
+
+
+# ------------------------------------------------------------
+# CSV parsing
+# ------------------------------------------------------------
+
+def _to_float(text):
+
+    if text is None:
+        return None
+
+    t = str(text).replace(",", "").replace('"', "").strip()
+
+    if t in ("", "-", "nan", "NaN", "None"):
+        return None
+
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _to_date(text):
+
+    t = str(text or "").strip()
+
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(t, fmt).date()
+        except ValueError:
+            continue
+
+    return None
+
+
+def parse_nse_csv(text):
+    """
+    Reads an NSE security-wise price CSV (raw NSE file or the
+    nselib DataFrame saved with to_csv) into
+    [{"date": datetime.date, "close": float}, ...]
+    ordered oldest -> newest.
+    """
+
+    reader = csv.reader(io.StringIO(text or ""))
+
+    date_i = close_i = series_i = None
+    header_found = False
+
+    picked = []
+
+    for cells in reader:
+
+        if not cells:
+            continue
+
+        if not header_found:
+
+            names = [
+                c.replace("\ufeff", "")
+                .replace(" ", "")
+                .strip()
+                .lower()
+                for c in cells
+            ]
+
+            if "date" in names:
+                for key in (
+                    "closeprice",
+                    "close",
+                    "closingprice",
+                ):
+                    if key in names:
+                        date_i = names.index("date")
+                        close_i = names.index(key)
+                        series_i = (
+                            names.index("series")
+                            if "series" in names
+                            else None
+                        )
+                        header_found = True
+                        break
+
+            # Anything before the header row is ignored.
+            continue
+
+        # A header repeated in the middle (joined chunks) is skipped.
+        if len(cells) <= max(date_i, close_i):
+            continue
+
+        d = _to_date(cells[date_i])
+        c = _to_float(cells[close_i])
+
+        if d is None or c is None:
+            continue
+
+        series = (
+            cells[series_i].strip().upper()
+            if series_i is not None and series_i < len(cells)
+            else ""
+        )
+
+        picked.append((d, c, series))
+
+    if not header_found:
+        raise ValueError(
+            "The NSE file has no Date / Close Price columns."
+        )
+
+    if not picked:
+        raise ValueError(
+            "NSE returned no price rows for this symbol "
+            "(check the symbol name)."
+        )
+
+    # Regular equity (EQ) rows only, when the file has them.
+    if any(item[2] == "EQ" for item in picked):
+        picked = [item for item in picked if item[2] == "EQ"]
+
+    by_date = {}
+
+    for d, c, _ in picked:
+        by_date[d] = c
+
+    return [
+        {"date": d, "close": by_date[d]}
+        for d in sorted(by_date)
+    ]
+
+
+# ------------------------------------------------------------
+# local CSV storage
+# ------------------------------------------------------------
+
+def _storage_dir():
+    """
+    Flet sets FLET_APP_STORAGE_DATA on Android/iOS; anywhere else
+    fall back to the temp folder.
+    """
+
+    base = (
+        os.environ.get("FLET_APP_STORAGE_DATA")
+        or tempfile.gettempdir()
+    )
+
+    folder = os.path.join(base, "nse_csv")
+
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception:
+        folder = base
+
+    return folder
+
+
+def csv_file_path(symbol):
+    return os.path.join(
+        _storage_dir(),
+        f"nse_{re.sub(r'[^A-Z0-9_-]', '_', symbol)}.csv",
+    )
+
+
+def _read_saved_csv(path):
+    """Returns (rows, age_seconds) or None."""
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+
+        rows = parse_nse_csv(text)
+
+        return rows, time.time() - os.path.getmtime(path)
+
+    except Exception:
+        return None
+
+
+def _save_csv(path, text):
+    try:
+        tmp = path + ".tmp"
+
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+
+        os.replace(tmp, path)
+
+    except Exception:
+        # Saving is a convenience; never fail because of it.
+        pass
+
+
+# ------------------------------------------------------------
+# download: nselib
+# ------------------------------------------------------------
+
+def _download_with_nselib(symbol, start, end):
+    """
+    Uses nselib (import is lazy, so the app still starts when
+    nselib is not bundled in the APK). Returns CSV text.
+    """
+
+    from nselib import capital_market
+
+    df = capital_market.price_volume_data(
+        symbol,
+        start.strftime(DMY),
+        end.strftime(DMY),
+    )
+
+    if df is None or len(df) == 0:
+        raise ValueError("nselib returned no rows.")
+
+    return df.to_csv(index=False)
+
+
+# ------------------------------------------------------------
+# download: direct from NSE (standard library only)
+# ------------------------------------------------------------
+
+def _ssl_context():
+    """
+    Android often has no system CA bundle that Python can see.
+    Use certifi when it is bundled, otherwise the default context.
+    """
+
+    try:
+        import certifi
+
+        return ssl.create_default_context(
+            cafile=certifi.where()
+        )
+
+    except Exception:
+        return ssl.create_default_context()
+
+
+def _nse_opener():
+    return urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(
+            http.cookiejar.CookieJar()
+        ),
+        urllib.request.HTTPSHandler(
+            context=_ssl_context()
+        ),
+    )
+
+
+def _read_body(response):
+
+    raw = response.read()
+
+    encoding = (
+        response.headers.get("Content-Encoding") or ""
+    ).lower()
+
+    if "gzip" in encoding:
+        raw = gzip.decompress(raw)
+
+    return raw.decode("utf-8-sig", errors="replace")
+
+
+def _nse_get(opener, url, headers):
+
+    request = urllib.request.Request(url, headers=headers)
+
+    with opener.open(request, timeout=25) as response:
+        return _read_body(response)
+
+
+def _download_direct_once(symbol, start, end):
+    """One full attempt: cookies first, then each <=1 year chunk."""
+
+    opener = _nse_opener()
+
+    # NSE only answers API calls that carry its site cookies.
+    _nse_get(opener, NSE_ORIGIN_URL, NSE_PAGE_HEADERS)
+
+    pieces = []
+
+    cursor = start
+
+    while cursor <= end:
+
+        chunk_end = min(
+            cursor + timedelta(days=NSE_MAX_CHUNK_DAYS),
+            end,
+        )
+
+        query = urllib.parse.urlencode(
+            {
+                "from": cursor.strftime(DMY),
+                "to": chunk_end.strftime(DMY),
+                "symbol": symbol,
+                "type": "priceVolume",
+                "series": "ALL",
+                "csv": "true",
+            }
+        )
+
+        body = _nse_get(
+            opener,
+            NSE_API_URL + query,
+            NSE_API_HEADERS,
+        )
+
+        head = body.lstrip()[:1]
+
+        if head in ("<", "{", "["):
+            raise ConnectionError(
+                "NSE did not send a CSV file "
+                "(it may be blocking this request)."
+            )
+
+        # Only the first piece keeps its header row.
+        lines = body.splitlines()
+
+        pieces.append(
+            "\n".join(lines if not pieces else lines[1:])
+        )
+
+        cursor = chunk_end + timedelta(days=1)
+
+        if cursor <= end:
+            time.sleep(1.0)
+
+    return "\n".join(pieces)
+
+
+def _download_direct(symbol, start, end):
+
+    last_error = "unknown error"
+
+    for attempt in range(FETCH_ATTEMPTS):
+
+        try:
+            text = _download_direct_once(symbol, start, end)
+
+            # Make sure it really is a usable price file.
+            parse_nse_csv(text)
+
+            return text
+
+        except ValueError:
+            # Readable answer from NSE (no rows, bad columns):
+            # retrying will not change it.
+            raise
+
+        except urllib.error.HTTPError as ex:
+            last_error = f"HTTP Error {ex.code}: {ex.reason}"
+
+            if ex.code not in RETRY_CODES:
+                raise ValueError(last_error)
+
+        except Exception as ex:
+            last_error = str(ex)
+
+        if attempt < FETCH_ATTEMPTS - 1:
+            time.sleep(
+                RETRY_PAUSE_SECONDS * (attempt + 1)
+            )
+
+    raise ValueError(last_error)
+
+
+# ------------------------------------------------------------
+# public loader
+# ------------------------------------------------------------
+
+def load_nse_history(
+    symbol,
+    days=60,
+    timezone_name="Asia/Kolkata",
+):
+    """
+    Returns (rows, source, csv_path).
+
+    source is one of:
+      "nselib"       downloaded now with nselib
+      "nse-direct"   downloaded now straight from NSE
+      "cache"        CSV saved earlier (less than 2 hours old)
+      "stale-cache"  download failed; older saved CSV used
+
+    timezone_name is accepted for the caller's benefit; NSE dates
+    are Indian dates, so IST is always used.
+    """
+
+    symbol = normalize_nse_symbol(symbol)
+
+    try:
+        days = int(days)
+    except Exception:
+        days = 60
+
+    days = max(MIN_DAYS, min(days, MAX_DAYS))
+
+    path = csv_file_path(symbol)
+
+    saved = _read_saved_csv(path)
+
+    if (
+        saved
+        and saved[1] < CACHE_FRESH_SECONDS
+        and len(saved[0]) >= days
+    ):
+        return saved[0][-days:], "cache", path
+
+    end = _india_today()
+
+    # Calendar days needed to cover `days` trading sessions.
+    start = end - timedelta(days=int(days * 7 / 5) + 12)
+
+    errors = []
+
+    attempts = []
+
+    if USE_NSELIB:
+        attempts.append(("nselib", _download_with_nselib))
+
+    attempts.append(("nse-direct", _download_direct))
+
+    for name, downloader in attempts:
+
+        try:
+            text = downloader(symbol, start, end)
+
+            rows = parse_nse_csv(text)[-days:]
+
+            if len(rows) < MIN_DAYS:
+                raise ValueError(
+                    f"only {len(rows)} price rows found; "
+                    f"at least {MIN_DAYS} are needed"
+                )
+
+            _save_csv(path, text)
+
+            return rows, name, path
+
+        except ImportError:
+            # nselib is not bundled in this build - not an error,
+            # the direct NSE download below does the same job.
+            continue
+
+        except Exception as ex:
+            errors.append(f"{name}: {ex}")
+
+    if saved and len(saved[0]) >= MIN_DAYS:
+        return saved[0][-days:], "stale-cache", path
+
+    raise ValueError(
+        f"Could not download NSE data for {symbol}. "
+        + " | ".join(errors)
+    )
 
 
 # ============================================================
@@ -837,36 +1396,39 @@ def analyze_stock(
     data=None,
 ):
     """
-    Analyze a stock using cached/live price data.
+    analyze_stock(symbol, hindi_name, days=60, timezone_name=...)
 
-    Existing main.py call remains valid:
+    Downloads the NSE India price history for `symbol` (saved as
+    a CSV file on the device), then runs the experimental Bandha
+    analysis on that CSV data.
 
-        analyze_stock(
-            symbol,
-            hindi_name,
-            days=days,
-            timezone_name=timezone_name,
-        )
+    "RELIANCE" and "RELIANCE.NS" both work.
 
-    Optional `data` can be supplied for offline testing.
+    Pass `data` (a list of {"date": date, "close": float}) to
+    skip the download, e.g. for offline tests.
     """
 
-    # Backward-compatible old call:
-    # analyze_stock(hindi_name, data)
-    if data is None and isinstance(hindi_name, (list, tuple)):
+    # Old call style: analyze_stock(hindi_name, data)
+    if data is None and isinstance(
+        hindi_name,
+        (list, tuple),
+    ):
         return analyze_stock_data(
             symbol,
             list(hindi_name),
         )
 
     source = "supplied"
+    csv_file = ""
 
     if data is None:
-        data, source = fetch_price_history_ex(
+        data, source, csv_file = load_nse_history(
             symbol,
-            days=days,
-            timezone_name=timezone_name,
+            days,
+            timezone_name,
         )
+
+        symbol = normalize_nse_symbol(symbol)
 
     result = analyze_stock_data(
         hindi_name or "",
@@ -878,5 +1440,6 @@ def analyze_stock(
     result["timezone"] = timezone_name
     result["data_points"] = len(data)
     result["data_source"] = source
+    result["data_file"] = csv_file
 
     return result
