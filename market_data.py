@@ -488,3 +488,39 @@ if __name__ == "__main__":
     print(message)
     print("First:", rows[0])
     print("Last :", rows[-1])
+
+# ---------------------------------------------------------------------------
+# Compatibility functions for the existing main.py
+# ---------------------------------------------------------------------------
+# The existing Flet V5 main.py imports:
+#   get_stock_history
+#   update_stock_history
+#   get_cache_csv_path
+#
+# Keep these names so main.py does not have to be rewritten just because
+# the data source changed from Yahoo to NSE.
+
+def get_cache_csv_path(symbol: str):
+    """Return the local NSE CSV path used by this module."""
+    return str(_local_filename(symbol))
+
+
+def get_stock_history(symbol: str, days: int = 30):
+    """
+    Existing main.py compatibility wrapper.
+
+    Returns only the historical rows, as before.
+    """
+    rows, _source = get_nse_history(symbol, days)
+    return rows
+
+
+def update_stock_history(symbol: str, days: int = 30):
+    """
+    Existing main.py compatibility wrapper.
+
+    Downloads/updates NSE data and returns the rows.
+    """
+    rows, _message = update_nse_history(symbol, days)
+    return rows
+
