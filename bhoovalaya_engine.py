@@ -813,377 +813,16 @@ def analyze_stock_data(
 
 # ============================================================
 # LIVE PRICE HISTORY
+# ============================================================
 #
-# Uses only the Python standard library (urllib), so nothing
-# extra has to be compiled into the Android APK.
+# Price downloading/cache is maintained in market_data.py.
+# Keeping it there prevents two independent Yahoo downloaders
+# from running inside the APK.
+#
+# The calculation/Bandha code above is intentionally unchanged.
 # ============================================================
 
-YAHOO_HOSTS = (
-    "query1.finance.yahoo.com",
-    "query2.finance.yahoo.com",
-)
-
-YAHOO_CHART_PATH = "/v8/finance/chart/{symbol}"
-
-# HTTP codes worth retrying (rate limit / temporary server trouble)
-RETRY_CODES = (429, 500, 502, 503, 504)
-
-# Number of full passes over the hosts, and the pause between them.
-FETCH_ROUNDS = 3
-RETRY_PAUSE_SECONDS = 2.0
-
-# A cached download younger than this is reused without touching
-# the network, so repeated taps on RUN TEST cannot trigger 429.
-CACHE_FRESH_SECONDS = 2 * 3600
-
-# 10 sessions are needed for the "previous 9" table,
-# a few more give the backtest something to work with.
-MIN_DAYS = 12
-MAX_DAYS = 730
-
-
-def _ssl_context():
-    """
-    Android often has no system CA bundle that Python can see.
-    Use certifi when it is bundled, otherwise the default context.
-    """
-
-    try:
-        import certifi
-
-        return ssl.create_default_context(
-            cafile=certifi.where()
-        )
-
-    except Exception:
-        return ssl.create_default_context()
-
-
-def parse_yahoo_chart(payload):
-    """
-    Converts Yahoo chart JSON into
-    [{"date": datetime.date, "close": float}, ...]
-    ordered oldest -> newest.
-    """
-
-    chart = (payload or {}).get("chart") or {}
-
-    error = chart.get("error")
-
-    if error:
-        raise ValueError(
-            "Yahoo Finance error: "
-            + str(
-                error.get("description")
-                or error
-            )
-        )
-
-    results = chart.get("result") or []
-
-    if not results:
-        raise ValueError(
-            "No price data returned for this symbol."
-        )
-
-    result = results[0]
-
-    timestamps = result.get("timestamp") or []
-
-    quote_list = (
-        (result.get("indicators") or {}).get("quote")
-        or [{}]
-    )
-
-    closes = quote_list[0].get("close") or []
-
-    # Exchange offset from UTC in seconds (IST = 19800).
-    offset = (
-        (result.get("meta") or {}).get("gmtoffset")
-        or 19800
-    )
-
-    epoch = datetime(1970, 1, 1)
-
-    by_date = {}
-
-    for ts, close in zip(timestamps, closes):
-
-        if close is None:
-            continue
-
-        local = epoch + timedelta(
-            seconds=int(ts) + int(offset)
-        )
-
-        by_date[local.date()] = float(close)
-
-    return [
-        {"date": d, "close": by_date[d]}
-        for d in sorted(by_date)
-    ]
-
-
-def _cache_path(symbol, days):
-    """
-    Cache file location. Flet sets FLET_APP_STORAGE_DATA on
-    Android/iOS; anywhere else fall back to the temp folder.
-    """
-
-    base = (
-        os.environ.get("FLET_APP_STORAGE_DATA")
-        or tempfile.gettempdir()
-    )
-
-    safe = "".join(
-        ch if ch.isalnum() else "_"
-        for ch in symbol
-    )
-
-    return os.path.join(
-        base,
-        f"bhoovalaya_prices_{safe}_{days}.json",
-    )
-
-
-def _cache_load(path):
-    """Returns (rows, age_seconds) or None."""
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            blob = json.load(f)
-
-        rows = [
-            {
-                "date": datetime.strptime(
-                    d, "%Y-%m-%d"
-                ).date(),
-                "close": float(c),
-            }
-            for d, c in blob["rows"]
-        ]
-
-        age = time.time() - float(blob["saved_at"])
-
-        if rows:
-            return rows, age
-
-    except Exception:
-        pass
-
-    return None
-
-
-def _cache_save(path, rows):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "saved_at": time.time(),
-                    "rows": [
-                        [str(r["date"]), r["close"]]
-                        for r in rows
-                    ],
-                },
-                f,
-            )
-    except Exception:
-        # Caching is a convenience; never fail because of it.
-        pass
-
-
-def _request_history(host, symbol, days):
-    """One HTTP request to one Yahoo host. Returns parsed rows."""
-
-    now = int(time.time())
-
-    # Calendar days needed to cover `days` trading sessions.
-    span = int(days * 7 / 5) + 12
-
-    query = urllib.parse.urlencode(
-        {
-            "period1": now - span * 86400,
-            "period2": now,
-            "interval": "1d",
-            "events": "history",
-        }
-    )
-
-    url = (
-        "https://"
-        + host
-        + YAHOO_CHART_PATH.format(
-            symbol=urllib.parse.quote(symbol)
-        )
-        + "?"
-        + query
-    )
-
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Mobile Safari/537.36"
-            ),
-            "Accept": "application/json,text/plain,*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://finance.yahoo.com/",
-        },
-    )
-
-    with urllib.request.urlopen(
-        request,
-        timeout=12,
-        context=_ssl_context(),
-    ) as response:
-        payload = json.loads(
-            response.read().decode("utf-8")
-        )
-
-    return parse_yahoo_chart(payload)
-
-
-def _download_history(symbol, days):
-    """
-    Tries both Yahoo hosts, several rounds, pausing between
-    rounds. Raises ValueError with a readable message on failure.
-    """
-
-    last_error = "unknown error"
-
-    for round_no in range(FETCH_ROUNDS):
-
-        retryable = False
-
-        for host in YAHOO_HOSTS:
-
-            try:
-                return _request_history(
-                    host,
-                    symbol,
-                    days,
-                )
-
-            except urllib.error.HTTPError as ex:
-
-                last_error = f"HTTP Error {ex.code}: {ex.reason}"
-
-                if ex.code in RETRY_CODES:
-                    retryable = True
-                    continue
-
-                # e.g. 404 for an unknown symbol: Yahoo puts the
-                # reason in the JSON body, so show that if present.
-                try:
-                    parse_yahoo_chart(
-                        json.loads(
-                            ex.read().decode("utf-8")
-                        )
-                    )
-                except ValueError as parsed:
-                    raise parsed
-                except Exception:
-                    pass
-
-                raise ValueError(last_error)
-
-            except json.JSONDecodeError as ex:
-                # Non-JSON reply (throttle page etc.) - retry.
-                last_error = f"unreadable reply ({ex})"
-                retryable = True
-
-            except ValueError:
-                # Yahoo answered but with an error / no data.
-                raise
-
-            except Exception as ex:
-                # Timeouts, DNS, SSL and so on - worth another try.
-                last_error = str(ex)
-                retryable = True
-
-        if not retryable:
-            break
-
-        if round_no < FETCH_ROUNDS - 1:
-            time.sleep(
-                RETRY_PAUSE_SECONDS * (round_no + 1)
-            )
-
-    raise ValueError(last_error)
-
-
-def fetch_price_history_ex(
-    symbol,
-    days=60,
-    timezone_name="Asia/Kolkata",
-):
-    """
-    Returns (rows, source) where source is one of:
-      "live"   - freshly downloaded
-      "cache"  - recent download reused (no network call)
-      "stale"  - download failed; older saved data was used
-
-    timezone_name is accepted for the caller's benefit; the
-    exchange's own UTC offset from Yahoo is used for dates.
-    """
-
-    symbol = (symbol or "").strip()
-
-    if not symbol:
-        raise ValueError("Stock symbol is empty.")
-
-    try:
-        days = int(days)
-    except Exception:
-        days = 60
-
-    days = max(MIN_DAYS, min(days, MAX_DAYS))
-
-    path = _cache_path(symbol, days)
-
-    cached = _cache_load(path)
-
-    if cached and cached[1] < CACHE_FRESH_SECONDS:
-        return cached[0], "cache"
-
-    try:
-        rows = _download_history(symbol, days)[-days:]
-
-        if len(rows) < MIN_DAYS:
-            raise ValueError(
-                f"Only {len(rows)} price rows found for "
-                f"{symbol}; at least {MIN_DAYS} are needed."
-            )
-
-    except ValueError as ex:
-
-        if cached:
-            return cached[0], "stale"
-
-        raise ValueError(
-            f"Could not download price data for "
-            f"{symbol}: {ex}"
-        )
-
-    _cache_save(path, rows)
-
-    return rows, "live"
-
-
-def fetch_price_history(
-    symbol,
-    days=60,
-    timezone_name="Asia/Kolkata",
-):
-    """Same as fetch_price_history_ex but returns only the rows."""
-
-    return fetch_price_history_ex(
-        symbol,
-        days,
-        timezone_name,
-    )[0]
+from market_data import fetch_price_history_ex
 
 
 # ============================================================
@@ -1198,20 +837,23 @@ def analyze_stock(
     data=None,
 ):
     """
-    analyze_stock(symbol, hindi_name, days=60, timezone_name=...)
+    Analyze a stock using cached/live price data.
 
-    Downloads the price history for `symbol`, then runs the
-    experimental Bandha analysis on it.
+    Existing main.py call remains valid:
 
-    Pass `data` (a list of {"date": date, "close": float}) to
-    skip the download, e.g. for offline tests.
+        analyze_stock(
+            symbol,
+            hindi_name,
+            days=days,
+            timezone_name=timezone_name,
+        )
+
+    Optional `data` can be supplied for offline testing.
     """
 
-    # Old call style: analyze_stock(hindi_name, data)
-    if data is None and isinstance(
-        hindi_name,
-        (list, tuple),
-    ):
+    # Backward-compatible old call:
+    # analyze_stock(hindi_name, data)
+    if data is None and isinstance(hindi_name, (list, tuple)):
         return analyze_stock_data(
             symbol,
             list(hindi_name),
@@ -1222,8 +864,8 @@ def analyze_stock(
     if data is None:
         data, source = fetch_price_history_ex(
             symbol,
-            days,
-            timezone_name,
+            days=days,
+            timezone_name=timezone_name,
         )
 
     result = analyze_stock_data(
