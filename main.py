@@ -1,573 +1,395 @@
 import flet as ft
 
 from bhoovalaya_engine import (
-    BANDHAS,
     analyze_stock,
+    BANDHAS,
 )
+from market_data import get_stock_history, update_stock_history, get_cache_csv_path
 
-
-# ============================================================
-# APP SETTINGS
-# ============================================================
 
 APP_TITLE = "Sri Bhoovalaya V5"
 
-LOCATION_NAME = "Mumbai, India"
-TIMEZONE_NAME = "Asia/Kolkata"
-TIMEZONE_DISPLAY = "Mumbai, India — IST (UTC+5:30)"
 
-DEFAULT_SYMBOL = "RELIANCE.NS"
-DEFAULT_HINDI_NAME = "रिलायंस"
-DEFAULT_DAYS = 60
-DEFAULT_BANDHA = "Saras"
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def safe_float(value, default=0.0):
-    try:
-        return float(value)
-    except Exception:
-        return default
-
-
-def direction_symbol(direction):
+def direction_icon(direction):
     if direction == "UP":
         return "↑"
-
     if direction == "DOWN":
         return "↓"
-
     return "—"
 
 
-def direction_text(direction):
-    if direction == "UP":
-        return "UP"
-
-    if direction == "DOWN":
-        return "DOWN"
-
-    return "—"
-
-
-def accuracy_color(accuracy):
-
-    if accuracy >= 70:
-        return ft.Colors.GREEN
-
-    if accuracy >= 50:
-        return ft.Colors.ORANGE
-
-    return ft.Colors.RED
+def hit_icon(value):
+    return "✓ HIT" if value else "✗ MISS"
 
 
 # ============================================================
-# SMALL INFORMATION CARD
+# TABLE
 # ============================================================
 
-def info_card(title, value, subtitle=""):
+def make_table(rows, columns):
+
+    table = ft.DataTable(
+        columns=[
+            ft.DataColumn(
+                ft.Text(
+                    c,
+                    weight=ft.FontWeight.BOLD
+                )
+            )
+            for c in columns
+        ],
+        rows=[],
+    )
+
+    for row in rows:
+
+        table.rows.append(
+            ft.DataRow(
+                cells=[
+                    ft.DataCell(
+                        ft.Text(
+                            str(
+                                row.get(c, "")
+                            )
+                        )
+                    )
+                    for c in columns
+                ]
+            )
+        )
+
+    return table
+
+
+# ============================================================
+# ACCURACY GRAPH
+#
+# Native Flet controls.
+# No flet-charts required.
+# ============================================================
+
+def make_accuracy_graph(
+    accuracy,
+    selected_bandha,
+):
+
+    controls = []
+
+    controls.append(
+        ft.Text(
+            "BANDHA ACCURACY GRAPH",
+            size=20,
+            weight=ft.FontWeight.BOLD,
+        )
+    )
+
+    controls.append(
+        ft.Text(
+            "Accuracy percentage from the historical backtest",
+            size=13,
+        )
+    )
+
+    for name in BANDHAS:
+
+        value = float(
+            accuracy[name]["accuracy"]
+        )
+
+        hits = accuracy[name]["hits"]
+        tests = accuracy[name]["tests"]
+
+        # Width of bar.
+        # Maximum 360 pixels.
+        bar_width = max(
+            4,
+            min(
+                360,
+                value * 3.6
+            )
+        )
+
+        # Make selected Bandha more prominent.
+        if name == selected_bandha:
+            bar_height = 30
+            text_size = 16
+            weight = ft.FontWeight.BOLD
+        else:
+            bar_height = 22
+            text_size = 13
+            weight = ft.FontWeight.NORMAL
+
+        bar = ft.Container(
+            width=bar_width,
+            height=bar_height,
+            bgcolor=(
+                ft.Colors.BLUE_700
+                if name == selected_bandha
+                else ft.Colors.BLUE_300
+            ),
+            border_radius=5,
+        )
+
+        controls.append(
+            ft.Row(
+                [
+                    ft.Container(
+                        content=ft.Text(
+                            name,
+                            size=text_size,
+                            weight=weight,
+                        ),
+                        width=90,
+                    ),
+
+                    ft.Container(
+                        content=bar,
+                        width=370,
+                    ),
+
+                    ft.Text(
+                        f"{value:.1f}%",
+                        size=text_size,
+                        weight=weight,
+                    ),
+
+                    ft.Text(
+                        f"({hits}/{tests})",
+                        size=12,
+                    ),
+                ],
+                spacing=5,
+            )
+        )
 
     return ft.Container(
         content=ft.Column(
+            controls,
+            spacing=8,
+        ),
+        padding=10,
+        border=ft.Border.all(
+            1,
+            ft.Colors.GREY_400,
+        ),
+        border_radius=8,
+    )
+
+
+# ============================================================
+# SELECTED BANDHA SUMMARY
+# ============================================================
+
+def make_selected_summary(
+    result,
+    selected_bandha,
+):
+
+    accuracy = result["accuracy"][
+        selected_bandha
+    ]
+
+    reference = result["bandhas"][
+        selected_bandha
+    ]
+
+    return ft.Container(
+
+        content=ft.Column(
             [
                 ft.Text(
-                    title,
-                    size=11,
-                    color=ft.Colors.GREY_600,
+                    f"SELECTED BANDHA: "
+                    f"{selected_bandha}",
+                    size=21,
+                    weight=ft.FontWeight.BOLD,
                 ),
 
                 ft.Text(
-                    value,
+                    f"Accuracy: "
+                    f"{accuracy['accuracy']:.1f}%",
                     size=20,
                     weight=ft.FontWeight.BOLD,
                 ),
 
                 ft.Text(
-                    subtitle,
-                    size=10,
-                    color=ft.Colors.GREY_600,
+                    f"Hits: {accuracy['hits']}    "
+                    f"Tests: {accuracy['tests']}    "
+                    f"Misses: {accuracy['misses']}",
+                    size=15,
+                ),
+
+                ft.Text(
+                    "Reference-day prediction: "
+                    f"{direction_icon(reference['signal'])}",
+                    size=16,
                 ),
             ],
-            spacing=2,
+            spacing=5,
+        ),
+
+        padding=12,
+
+        border=ft.Border.all(
+            1,
+            ft.Colors.GREY_400,
+        ),
+
+        border_radius=8,
+    )
+
+
+# ============================================================
+# SIMPLE PRICE GRAPH
+#
+# Uses native Flet containers.
+# This is deliberately simple and Android-safe.
+# ============================================================
+
+def make_price_graph(
+    backtest,
+    selected_bandha,
+):
+
+    if not backtest:
+
+        return ft.Text(
+            "No price data available."
+        )
+
+    values = []
+
+    for item in backtest:
+
+        try:
+            values.append(
+                float(item["close"])
+            )
+        except Exception:
+            pass
+
+    if not values:
+
+        return ft.Text(
+            "No numeric price data."
+        )
+
+    minimum = min(values)
+    maximum = max(values)
+
+    if maximum == minimum:
+        maximum = minimum + 1
+
+    graph_height = 220
+    graph_width = 700
+
+    # Only show last 30 points if
+    # very large test is selected.
+    display = backtest[-30:]
+
+    bars = []
+
+    for item in display:
+
+        try:
+            price = float(
+                item["close"]
+            )
+        except Exception:
+            continue
+
+        ratio = (
+            price - minimum
+        ) / (
+            maximum - minimum
+        )
+
+        height = max(
+            5,
+            ratio * graph_height
+        )
+
+        bars.append(
+            ft.Column(
+                [
+                    ft.Text(
+                        f"{price:.0f}",
+                        size=8,
+                    ),
+
+                    ft.Container(
+                        width=10,
+                        height=height,
+                        bgcolor=(
+                            ft.Colors.GREEN_500
+                            if item[
+                                selected_bandha
+                            ] == item[
+                                "actual"
+                            ]
+                            else ft.Colors.RED_400
+                        ),
+                        border_radius=3,
+                    ),
+
+                    ft.Text(
+                        str(
+                            item["date"]
+                        )[-5:],
+                        size=8,
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.END,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            )
+        )
+
+    return ft.Container(
+
+        content=ft.Column(
+            [
+                ft.Text(
+                    f"PRICE / BACKTEST GRAPH — "
+                    f"{selected_bandha}",
+                    size=18,
+                    weight=ft.FontWeight.BOLD,
+                ),
+
+                ft.Text(
+                    "Green = selected Bandha matched "
+                    "the next trading-day direction; "
+                    "Red = MISS",
+                    size=12,
+                ),
+
+                ft.Container(
+                    content=ft.Row(
+                        bars,
+                        spacing=8,
+                        scroll=ft.ScrollMode.AUTO,
+                        vertical_alignment=(
+                            ft.CrossAxisAlignment.END
+                        ),
+                    ),
+                    height=300,
+                    width=graph_width,
+                ),
+            ],
+            spacing=5,
         ),
 
         padding=10,
 
         border=ft.Border.all(
             1,
-            ft.Colors.GREY_300,
+            ft.Colors.GREY_400,
         ),
 
-        border_radius=10,
-
-        expand=True,
+        border_radius=8,
     )
 
 
 # ============================================================
-# SELECTED BANDHA ACCURACY GRAPH
-# ============================================================
-
-def make_selected_accuracy_graph(
-    backtest,
-    selected_bandha,
-):
-
-    hits = 0
-    tests = 0
-
-    for item in backtest:
-
-        actual = item.get("actual")
-
-        prediction = item.get(
-            selected_bandha
-        )
-
-        if actual not in ("UP", "DOWN"):
-            continue
-
-        if prediction not in ("UP", "DOWN"):
-            continue
-
-        tests += 1
-
-        if prediction == actual:
-            hits += 1
-
-    misses = tests - hits
-
-    if tests:
-        accuracy = (
-            hits / tests
-        ) * 100.0
-    else:
-        accuracy = 0.0
-
-    hit_fraction = (
-        hits / tests
-        if tests
-        else 0.0
-    )
-
-    miss_fraction = (
-        misses / tests
-        if tests
-        else 0.0
-    )
-
-    acc_color = accuracy_color(
-        accuracy
-    )
-
-    return ft.Container(
-
-        content=ft.Column(
-            [
-
-                # ------------------------------------------------
-                # TITLE + BIG ACCURACY
-                # ------------------------------------------------
-
-                ft.Row(
-                    [
-
-                        ft.Text(
-                            f"{selected_bandha} — "
-                            f"Historical Backtest",
-                            size=17,
-                            weight=ft.FontWeight.BOLD,
-                        ),
-
-                        ft.Container(
-                            expand=True
-                        ),
-
-                        ft.Text(
-                            f"{accuracy:.1f}%",
-                            size=25,
-                            weight=ft.FontWeight.BOLD,
-                            color=acc_color,
-                        ),
-                    ],
-
-                    vertical_alignment=
-                    ft.CrossAxisAlignment.CENTER,
-                ),
-
-                ft.Text(
-                    "Historical accuracy only — "
-                    "not a future guarantee.",
-                    size=10,
-                    color=ft.Colors.GREY_600,
-                ),
-
-                ft.Container(
-                    height=5
-                ),
-
-                # ------------------------------------------------
-                # ACCURACY BAR
-                # ------------------------------------------------
-
-                ft.ProgressBar(
-                    value=max(
-                        0.0,
-                        min(
-                            1.0,
-                            accuracy / 100.0
-                        ),
-                    ),
-
-                    color=acc_color,
-
-                    bgcolor=ft.Colors.GREY_300,
-
-                    height=12,
-                ),
-
-                ft.Container(
-                    height=8
-                ),
-
-                # ------------------------------------------------
-                # HIT
-                # ------------------------------------------------
-
-                ft.Text(
-                    f"HIT   {hits}   "
-                    f"({hit_fraction * 100:.1f}%)",
-
-                    size=12,
-
-                    weight=ft.FontWeight.BOLD,
-                ),
-
-                ft.ProgressBar(
-                    value=hit_fraction,
-
-                    color=ft.Colors.GREEN,
-
-                    bgcolor=ft.Colors.GREY_200,
-
-                    height=9,
-                ),
-
-                ft.Container(
-                    height=5
-                ),
-
-                # ------------------------------------------------
-                # MISS
-                # ------------------------------------------------
-
-                ft.Text(
-                    f"MISS   {misses}   "
-                    f"({miss_fraction * 100:.1f}%)",
-
-                    size=12,
-
-                    weight=ft.FontWeight.BOLD,
-                ),
-
-                ft.ProgressBar(
-                    value=miss_fraction,
-
-                    color=ft.Colors.RED,
-
-                    bgcolor=ft.Colors.GREY_200,
-
-                    height=9,
-                ),
-
-                ft.Container(
-                    height=8
-                ),
-
-                # ------------------------------------------------
-                # SUMMARY CARDS
-                # ------------------------------------------------
-
-                ft.Row(
-                    [
-
-                        info_card(
-                            "HIT",
-                            str(hits),
-                            "Correct",
-                        ),
-
-                        info_card(
-                            "MISS",
-                            str(misses),
-                            "Incorrect",
-                        ),
-
-                        info_card(
-                            "TESTS",
-                            str(tests),
-                            "Completed",
-                        ),
-
-                    ],
-
-                    spacing=7,
-                ),
-            ],
-
-            spacing=4,
-        ),
-
-        padding=13,
-
-        border=ft.Border.all(
-            1,
-            ft.Colors.GREY_300,
-        ),
-
-        border_radius=12,
-    )
-
-
-# ============================================================
-# DATE-BY-DATE HIT / MISS GRAPH
-# ============================================================
-
-def make_hit_miss_graph(
-    backtest,
-    selected_bandha,
-):
-
-    rows = []
-
-    for item in backtest:
-
-        actual = item.get("actual")
-
-        prediction = item.get(
-            selected_bandha
-        )
-
-        if actual not in ("UP", "DOWN"):
-            continue
-
-        date_value = str(
-            item.get(
-                "date",
-                ""
-            )
-        )
-
-        pred_symbol = direction_symbol(
-            prediction
-        )
-
-        actual_symbol = direction_symbol(
-            actual
-        )
-
-        is_hit = (
-            prediction == actual
-        )
-
-        if is_hit:
-
-            bg = ft.Colors.GREEN_100
-
-            status = "HIT"
-
-            status_color = ft.Colors.GREEN
-
-        else:
-
-            bg = ft.Colors.RED_100
-
-            status = "MISS"
-
-            status_color = ft.Colors.RED
-
-        rows.append(
-
-            ft.Container(
-
-                content=ft.Row(
-                    [
-
-                        ft.Container(
-                            content=ft.Text(
-                                date_value,
-                                size=11,
-                                weight=ft.FontWeight.BOLD,
-                            ),
-
-                            width=75,
-                        ),
-
-                        ft.Container(
-                            content=ft.Text(
-                                pred_symbol,
-                                size=21,
-                                weight=ft.FontWeight.BOLD,
-                            ),
-
-                            width=35,
-
-                            alignment=ft.Alignment.CENTER,
-                        ),
-
-                        ft.Container(
-                            content=ft.Text(
-                                actual_symbol,
-                                size=21,
-                                weight=ft.FontWeight.BOLD,
-                            ),
-
-                            width=35,
-
-                            alignment=ft.Alignment.CENTER,
-                        ),
-
-                        ft.Container(
-                            content=ft.Text(
-                                status,
-                                size=11,
-                                weight=ft.FontWeight.BOLD,
-                                color=status_color,
-                            ),
-
-                            width=55,
-                        ),
-
-                        ft.Text(
-                            f"{direction_text(prediction)} / "
-                            f"{direction_text(actual)}",
-
-                            size=10,
-
-                            expand=True,
-                        ),
-                    ],
-
-                    vertical_alignment=
-                    ft.CrossAxisAlignment.CENTER,
-                ),
-
-                padding=7,
-
-                margin=ft.Margin(
-                    bottom=2
-                ),
-
-                bgcolor=bg,
-
-                border_radius=7,
-            )
-        )
-
-    # --------------------------------------------------------
-    # HEADER
-    # --------------------------------------------------------
-
-    header = ft.Container(
-
-        content=ft.Row(
-            [
-
-                ft.Container(
-                    content=ft.Text(
-                        "DATE",
-                        size=10,
-                        weight=ft.FontWeight.BOLD,
-                    ),
-                    width=75,
-                ),
-
-                ft.Container(
-                    content=ft.Text(
-                        "PRED",
-                        size=10,
-                        weight=ft.FontWeight.BOLD,
-                    ),
-                    width=35,
-                ),
-
-                ft.Container(
-                    content=ft.Text(
-                        "ACT",
-                        size=10,
-                        weight=ft.FontWeight.BOLD,
-                    ),
-                    width=35,
-                ),
-
-                ft.Container(
-                    content=ft.Text(
-                        "RESULT",
-                        size=10,
-                        weight=ft.FontWeight.BOLD,
-                    ),
-                    width=55,
-                ),
-
-                ft.Text(
-                    "PRED / ACT",
-                    size=10,
-                    weight=ft.FontWeight.BOLD,
-                ),
-            ]
-        ),
-
-        padding=7,
-    )
-
-    return ft.Container(
-
-        content=ft.Column(
-            [
-
-                ft.Text(
-                    f"{selected_bandha} — "
-                    f"Day-by-Day Result",
-                    size=16,
-                    weight=ft.FontWeight.BOLD,
-                ),
-
-                ft.Text(
-                    "Green = HIT     Red = MISS",
-                    size=10,
-                    color=ft.Colors.GREY_600,
-                ),
-
-                header,
-
-                ft.Column(
-                    rows,
-
-                    spacing=1,
-
-                    scroll=ft.ScrollMode.AUTO,
-                ),
-            ],
-
-            spacing=3,
-        ),
-
-        padding=11,
-
-        border=ft.Border.all(
-            1,
-            ft.Colors.GREY_300,
-        ),
-
-        border_radius=12,
-    )
-
-
-# ============================================================
-# SELECTED BANDHA SECTION
+# SELECTED BANDHA DETAILS
 # ============================================================
 
 def build_selected_bandha_section(
@@ -575,397 +397,139 @@ def build_selected_bandha_section(
     selected_bandha,
 ):
 
-    backtest = result.get(
-        "backtest",
-        []
-    )
-
-    return ft.Column(
-        [
-
-            ft.Text(
-                f"Selected Bandha: "
-                f"{selected_bandha}",
-
-                size=19,
-
-                weight=ft.FontWeight.BOLD,
-            ),
-
-            make_selected_accuracy_graph(
-                backtest,
-                selected_bandha,
-            ),
-
-            make_hit_miss_graph(
-                backtest,
-                selected_bandha,
-            ),
-        ],
-
-        spacing=10,
-    )
-
-
-# ============================================================
-# ALL BANDHA COMPARISON
-# ============================================================
-
-def make_bandha_comparison_graph(
-    accuracy
-):
-
     controls = []
 
-    for name in BANDHAS:
+    # --------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------
 
-        data = accuracy.get(
-            name,
-            {
-                "accuracy": 0.0
-            },
+    controls.append(
+        make_selected_summary(
+            result,
+            selected_bandha,
         )
-
-        value = safe_float(
-            data.get(
-                "accuracy",
-                0.0
-            )
-        )
-
-        controls.append(
-
-            ft.Container(
-
-                content=ft.Column(
-                    [
-
-                        ft.Row(
-                            [
-
-                                ft.Text(
-                                    name,
-                                    size=11,
-                                    weight=ft.FontWeight.BOLD,
-                                ),
-
-                                ft.Container(
-                                    expand=True
-                                ),
-
-                                ft.Text(
-                                    f"{value:.1f}%",
-                                    size=11,
-                                    weight=ft.FontWeight.BOLD,
-                                ),
-                            ]
-                        ),
-
-                        ft.ProgressBar(
-
-                            value=max(
-                                0.0,
-                                min(
-                                    1.0,
-                                    value / 100.0
-                                ),
-                            ),
-
-                            height=9,
-                        ),
-                    ],
-
-                    spacing=3,
-                ),
-
-                padding=4,
-            )
-        )
-
-    return ft.Container(
-
-        content=ft.Column(
-            [
-
-                ft.Text(
-                    "All Bandhas — "
-                    "Historical Accuracy",
-
-                    size=16,
-
-                    weight=ft.FontWeight.BOLD,
-                ),
-
-                ft.Text(
-                    "For comparison only.",
-                    size=10,
-                    color=ft.Colors.GREY_600,
-                ),
-
-                ft.Column(
-                    controls,
-                    spacing=3,
-                ),
-            ],
-
-            spacing=4,
-        ),
-
-        padding=11,
-
-        border=ft.Border.all(
-            1,
-            ft.Colors.GREY_300,
-        ),
-
-        border_radius=12,
     )
 
+    # --------------------------------------------------------
+    # ACCURACY GRAPH
+    # --------------------------------------------------------
 
-# ============================================================
-# ACCURACY TABLE
-# ============================================================
+    controls.append(
+        make_accuracy_graph(
+            result["accuracy"],
+            selected_bandha,
+        )
+    )
 
-def make_table(
-    accuracy
-):
+    # --------------------------------------------------------
+    # PRICE GRAPH
+    # --------------------------------------------------------
+
+    controls.append(
+        make_price_graph(
+            result["backtest"],
+            selected_bandha,
+        )
+    )
+
+    # --------------------------------------------------------
+    # SELECTED BANDHA BACKTEST
+    # --------------------------------------------------------
+
+    controls.append(
+        ft.Text(
+            f"{selected_bandha} — "
+            "DAY N → NEXT DAY",
+            size=19,
+            weight=ft.FontWeight.BOLD,
+        )
+    )
 
     rows = []
 
-    for name in BANDHAS:
+    for item in result["backtest"]:
 
-        data = accuracy.get(
-            name,
-            {
-                "hits": 0,
-                "tests": 0,
-                "misses": 0,
-                "accuracy": 0.0,
-            },
-        )
-
-        rows.append(
-
-            ft.DataRow(
-
-                cells=[
-
-                    ft.DataCell(
-                        ft.Text(name)
-                    ),
-
-                    ft.DataCell(
-                        ft.Text(
-                            str(
-                                data.get(
-                                    "hits",
-                                    0
-                                )
-                            )
-                        )
-                    ),
-
-                    ft.DataCell(
-                        ft.Text(
-                            str(
-                                data.get(
-                                    "misses",
-                                    0
-                                )
-                            )
-                        )
-                    ),
-
-                    ft.DataCell(
-                        ft.Text(
-                            str(
-                                data.get(
-                                    "tests",
-                                    0
-                                )
-                            )
-                        )
-                    ),
-
-                    ft.DataCell(
-                        ft.Text(
-                            f'{safe_float(data.get("accuracy", 0)):.1f}%'
-                        )
-                    ),
-                ]
-            )
-        )
-
-    return ft.DataTable(
-
-        columns=[
-
-            ft.DataColumn(
-                ft.Text("Bandha")
-            ),
-
-            ft.DataColumn(
-                ft.Text("HIT")
-            ),
-
-            ft.DataColumn(
-                ft.Text("MISS")
-            ),
-
-            ft.DataColumn(
-                ft.Text("TEST")
-            ),
-
-            ft.DataColumn(
-                ft.Text("Accuracy")
-            ),
-        ],
-
-        rows=rows,
-
-        column_spacing=18,
-
-        heading_row_height=38,
-
-        data_row_min_height=36,
-    )
-
-
-# ============================================================
-# PREVIOUS 9 DAYS
-# ============================================================
-
-def make_previous_table(
-    previous
-):
-
-    rows = []
-
-    for item in previous:
-
-        rows.append(
-
-            ft.DataRow(
-
-                cells=[
-
-                    ft.DataCell(
-                        ft.Text(
-                            str(
-                                item.get(
-                                    "date",
-                                    ""
-                                )
-                            )
-                        )
-                    ),
-
-                    ft.DataCell(
-                        ft.Text(
-                            direction_symbol(
-                                item.get(
-                                    "actual"
-                                )
-                            ),
-
-                            size=19,
-
-                            weight=ft.FontWeight.BOLD,
-                        )
-                    ),
-                ]
-            )
-        )
-
-    return ft.DataTable(
-
-        columns=[
-
-            ft.DataColumn(
-                ft.Text("Date")
-            ),
-
-            ft.DataColumn(
-                ft.Text("Actual")
-            ),
-        ],
-
-        rows=rows,
-
-        column_spacing=30,
-    )
-
-
-# ============================================================
-# NEXT 9 SIGNALS
-# ============================================================
-
-def make_next_table(
-    next_signals,
-    selected_bandha,
-):
-
-    rows = []
-
-    for item in next_signals:
-
-        prediction = item.get(
+        signal = item[
             selected_bandha
-        )
+        ]
+
+        actual = item[
+            "actual"
+        ]
 
         rows.append(
-
-            ft.DataRow(
-
-                cells=[
-
-                    ft.DataCell(
-                        ft.Text(
-                            str(
-                                item.get(
-                                    "date",
-                                    ""
-                                )
-                            )
-                        )
-                    ),
-
-                    ft.DataCell(
-
-                        ft.Text(
-
-                            direction_symbol(
-                                prediction
-                            ),
-
-                            size=20,
-
-                            weight=ft.FontWeight.BOLD,
-                        )
-                    ),
-                ]
-            )
+            {
+                "Date": item["date"],
+                "Close": item["close"],
+                "Actual": direction_icon(
+                    actual
+                ),
+                "Signal": direction_icon(
+                    signal
+                ),
+                "Result": hit_icon(
+                    signal == actual
+                ),
+            }
         )
 
-    return ft.DataTable(
-
-        columns=[
-
-            ft.DataColumn(
-                ft.Text("Date")
-            ),
-
-            ft.DataColumn(
-                ft.Text(
-                    f"{selected_bandha} Signal"
+    controls.append(
+        ft.Row(
+            [
+                make_table(
+                    rows,
+                    [
+                        "Date",
+                        "Close",
+                        "Actual",
+                        "Signal",
+                        "Result",
+                    ],
                 )
-            ),
-        ],
-
-        rows=rows,
-
-        column_spacing=25,
+            ],
+            scroll=ft.ScrollMode.AUTO,
+        )
     )
+
+    # --------------------------------------------------------
+    # NEXT 9 DAYS
+    # --------------------------------------------------------
+
+    controls.append(
+        ft.Text(
+            f"NEXT 9 EXPERIMENTAL SIGNALS — "
+            f"{selected_bandha}",
+            size=19,
+            weight=ft.FontWeight.BOLD,
+        )
+    )
+
+    future_rows = []
+
+    for item in result["future"]:
+
+        future_rows.append(
+            {
+                "Date": item["date"],
+                "Prediction": direction_icon(
+                    item[
+                        selected_bandha
+                    ]
+                ),
+            }
+        )
+
+    controls.append(
+        make_table(
+            future_rows,
+            [
+                "Date",
+                "Prediction",
+            ],
+        )
+    )
+
+    return controls
 
 
 # ============================================================
@@ -980,560 +544,589 @@ def main(page: ft.Page):
 
     page.scroll = ft.ScrollMode.AUTO
 
-    page.theme_mode = ft.ThemeMode.LIGHT
+    # ========================================================
+    # INPUTS
+    # ========================================================
 
-    # --------------------------------------------------------
-    # INPUT FIELDS
-    # --------------------------------------------------------
-
-    symbol_field = ft.TextField(
-
-        label="Stock Symbol",
-
-        value=DEFAULT_SYMBOL,
-
-        dense=True,
-
-        expand=True,
+    symbol = ft.TextField(
+        label="NSE Symbol",
+        value="RELIANCE.NS",
+        width=260,
     )
 
-    hindi_field = ft.TextField(
-
+    hindi_name = ft.TextField(
         label="Hindi Stock Name",
-
-        value=DEFAULT_HINDI_NAME,
-
-        dense=True,
-
-        expand=True,
+        value="रिलायंस",
+        width=260,
     )
 
     days_field = ft.TextField(
-
-        label="Test Days",
-
-        value=str(
-            DEFAULT_DAYS
-        ),
-
-        dense=True,
-
-        keyboard_type=
-        ft.KeyboardType.NUMBER,
-
-        expand=True,
+        label="Test days",
+        value="60",
+        width=150,
+        keyboard_type=ft.KeyboardType.NUMBER,
     )
 
-    bandha_dropdown = ft.Dropdown(
-
+    selected_bandha = ft.Dropdown(
         label="Select Bandha",
-
-        value=DEFAULT_BANDHA,
-
+        width=230,
+        value="Saras",
         options=[
-
             ft.DropdownOption(
-
                 key=name,
-
                 text=name,
             )
-
             for name in BANDHAS
         ],
-
-        expand=True,
     )
 
-    # --------------------------------------------------------
-    # OUTPUT
-    # --------------------------------------------------------
-
-    status_text = ft.Text(
-
-        "Enter stock details and press RUN TEST.",
-
-        size=11,
-
-        color=ft.Colors.GREY_700,
+    status = ft.Text(
+        "Ready"
     )
 
-    selected_area = ft.Column(
-        spacing=10
+    summary = ft.Text(
+        "",
+        size=14,
+        selectable=True,
     )
 
-    result_area = ft.Column(
-        spacing=10
+    result_column = ft.Column(
+        spacing=10,
+        scroll=ft.ScrollMode.AUTO,
     )
 
-    # Store latest result
-    latest_result = {
-        "value": None
+    # Latest result
+    state = {
+        "result": None
     }
 
-    # --------------------------------------------------------
-    # RUN TEST
-    # --------------------------------------------------------
+    # ========================================================
+    # SELECTED BANDHA AREA
+    # ========================================================
 
-    def run_test(e=None):
+    selected_section = ft.Column(
+        spacing=10
+    )
 
-        status_text.value = (
-            "Running test..."
+    # ========================================================
+    # BANDHA CHANGE
+    # ========================================================
+
+    def bandha_changed(e):
+
+        result = state["result"]
+
+        if result is None:
+            return
+
+        name = selected_bandha.value
+
+        if name not in BANDHAS:
+            return
+
+        # THIS IS THE IMPORTANT FIX.
+        #
+        # Rebuild the entire selected Bandha
+        # section every time dropdown changes.
+
+        selected_section.controls.clear()
+
+        selected_section.controls.extend(
+            build_selected_bandha_section(
+                result,
+                name,
+            )
         )
-
-        selected_area.controls.clear()
-
-        result_area.controls.clear()
 
         page.update()
 
+    selected_bandha.on_select = (
+        bandha_changed
+    )
+
+    # ========================================================
+    # UPDATE NSE MARKET DATA
+    # ========================================================
+
+    def update_market_data(e):
+
         try:
+            sym = symbol.value.strip().upper()
 
-            symbol = (
-                symbol_field.value
-                or DEFAULT_SYMBOL
-            ).strip()
-
-            hindi_name = (
-                hindi_field.value
-                or DEFAULT_HINDI_NAME
-            ).strip()
+            if not sym:
+                status.value = "Enter NSE symbol."
+                page.update()
+                return
 
             try:
+                days = int(days_field.value)
+            except Exception:
+                days = 60
 
+            allowed = [30, 60, 90, 120, 180]
+            if days not in allowed:
+                days = min(allowed, key=lambda x: abs(x - days))
+                days_field.value = str(days)
+
+            status.value = f"Downloading {days} NSE sessions for {sym}..."
+            page.update()
+
+            rows, csv_path = update_stock_history(
+                sym,
+                period_days=days,
+            )
+
+            status.value = (
+                f"NSE download complete: {len(rows)} sessions saved. "
+                f"Local file: {csv_path}"
+            )
+            page.update()
+
+        except Exception as ex:
+            status.value = f"NSE UPDATE ERROR: {type(ex).__name__}: {ex}"
+            page.update()
+
+
+    # ========================================================
+    # RUN TEST
+    # ========================================================
+
+    def run_test(e):
+
+        result_column.controls.clear()
+
+        selected_section.controls.clear()
+
+        summary.value = ""
+
+        state["result"] = None
+
+        try:
+
+            sym = (
+                symbol.value
+                .strip()
+                .upper()
+            )
+
+            if not sym:
+
+                status.value = (
+                    "Enter NSE symbol."
+                )
+
+                page.update()
+
+                return
+
+            # ------------------------------------------------
+            # DAYS
+            # ------------------------------------------------
+
+            try:
                 days = int(
                     days_field.value
-                    or DEFAULT_DAYS
+                )
+            except Exception:
+                days = 60
+
+            allowed = [
+                30,
+                60,
+                90,
+                120,
+                180,
+            ]
+
+            if days not in allowed:
+
+                days = min(
+                    allowed,
+                    key=lambda x:
+                    abs(x - days)
                 )
 
-            except Exception:
+                days_field.value = (
+                    str(days)
+                )
 
-                days = DEFAULT_DAYS
+            # ------------------------------------------------
+            # DOWNLOAD
+            # ------------------------------------------------
 
-            if days < 1:
-                days = DEFAULT_DAYS
-
-            selected_bandha = (
-                bandha_dropdown.value
-                or DEFAULT_BANDHA
+            status.value = (
+                f"Loading {days} NSE trading sessions..."
             )
 
-            # =================================================
-            # IMPORTANT:
-            # Current engine expects:
-            #
-            # analyze_stock(
-            #     symbol,
-            #     hindi_name,
-            #     days=...,
-            #     timezone_name=...
-            # )
-            #
-            # It does NOT accept history=.
-            # =================================================
+            page.update()
+
+            data = get_stock_history(
+                sym,
+                period_days=days,
+                force_refresh=False,
+            )
+
+            if not data:
+
+                status.value = (
+                    "No market data received."
+                )
+
+                page.update()
+
+                return
+
+            if len(data) < 10:
+
+                status.value = (
+                    f"Only {len(data)} "
+                    "sessions received. "
+                    "At least 10 are required."
+                )
+
+                page.update()
+
+                return
+
+            # ------------------------------------------------
+            # CALCULATE
+            # ------------------------------------------------
+
+            status.value = (
+                "Calculating "
+                "Bhoovalaya signals..."
+            )
+
+            page.update()
 
             result = analyze_stock(
-
-                symbol,
-
-                hindi_name,
-
-                days=days,
-
-                timezone_name=
-                TIMEZONE_NAME,
+                hindi_name.value.strip(),
+                data,
             )
 
-            latest_result["value"] = result
+            state["result"] = result
 
-            accuracy = result.get(
-                "accuracy",
-                {}
-            )
+            # ------------------------------------------------
+            # SUMMARY
+            # ------------------------------------------------
 
-            backtest = result.get(
-                "backtest",
-                []
-            )
+            ak = result["akshara"]
 
-            previous = result.get(
-                "previous_9",
-                []
-            )
+            moon = result["moon"]
 
-            next_signals = result.get(
-                "next_9",
-                []
+            summary.value = (
+
+                f"Stock: {sym}\n"
+
+                f"Hindi name: "
+                f"{hindi_name.value.strip()}\n"
+
+                f"Akshara value: "
+                f"{ak['total']}\n"
+
+                f"Nakshatra: "
+                f"{moon['nakshatra']}\n"
+
+                f"Pada: "
+                f"{moon['pada']}\n"
+
+                f"729 cell: "
+                f"{result['cell']}\n"
+
+                f"Row: "
+                f"{result['row'] + 1}\n"
+
+                f"Column: "
+                f"{result['col'] + 1}\n"
+
+                f"Cell value: "
+                f"{result['cell_value']}\n"
+
+                f"Reference date: "
+                f"{result['reference_date']}\n"
+
+                f"Backtest sessions: "
+                f"{len(result['backtest'])}"
             )
 
             # ------------------------------------------------
-            # HEADER
+            # 729 CELL
             # ------------------------------------------------
 
-            result_area.controls.append(
-
-                ft.Container(
-
-                    content=ft.Column(
-                        [
-
-                            ft.Text(
-                                "Sri Bhoovalaya V5",
-
-                                size=22,
-
-                                weight=
-                                ft.FontWeight.BOLD,
-                            ),
-
-                            ft.Text(
-                                f"{symbol} | "
-                                f"{hindi_name}",
-
-                                size=13,
-                            ),
-
-                            ft.Text(
-                                TIMEZONE_DISPLAY,
-
-                                size=10,
-
-                                color=
-                                ft.Colors.GREY_600,
-                            ),
-                        ],
-
-                        spacing=2,
-                    ),
-
-                    padding=8,
-                )
-            )
-
-            # ------------------------------------------------
-            # SELECTED BANDHA
-            # ------------------------------------------------
-
-            selected_area.controls.append(
-
-                build_selected_bandha_section(
-
-                    result,
-
-                    selected_bandha,
-                )
-            )
-
-            # ------------------------------------------------
-            # ALL BANDHAS
-            # ------------------------------------------------
-
-            result_area.controls.append(
+            result_column.controls.append(
 
                 ft.Text(
-
-                    "All Bandhas",
-
-                    size=18,
-
-                    weight=
-                    ft.FontWeight.BOLD,
+                    "729-CELL / CHAKRA",
+                    size=20,
+                    weight=ft.FontWeight.BOLD,
                 )
             )
 
-            result_area.controls.append(
+            result_column.controls.append(
 
-                make_bandha_comparison_graph(
-                    accuracy
+                ft.Text(
+                    f"Selected cell = "
+                    f"{result['cell']}\n"
+
+                    f"Row = "
+                    f"{result['row'] + 1}\n"
+
+                    f"Column = "
+                    f"{result['col'] + 1}\n"
+
+                    f"Cell value = "
+                    f"{result['cell_value']}"
                 )
             )
 
             # ------------------------------------------------
-            # TABLE
+            # ALL BANDHA ACCURACY TABLE
             # ------------------------------------------------
 
-            result_area.controls.append(
+            result_column.controls.append(
 
-                ft.Container(
-
-                    content=ft.Column(
-                        [
-
-                            ft.Text(
-                                "Accuracy Table",
-
-                                size=15,
-
-                                weight=
-                                ft.FontWeight.BOLD,
-                            ),
-
-                            ft.Row(
-
-                                [
-                                    make_table(
-                                        accuracy
-                                    )
-                                ],
-
-                                scroll=
-                                ft.ScrollMode.AUTO,
-                            ),
-                        ],
-
-                        spacing=4,
-                    ),
-
-                    padding=8,
-
-                    border=
-                    ft.Border.all(
-                        1,
-                        ft.Colors.GREY_300,
-                    ),
-
-                    border_radius=10,
+                ft.Text(
+                    "SIX BANDHA ACCURACY",
+                    size=20,
+                    weight=ft.FontWeight.BOLD,
                 )
+            )
+
+            accuracy_rows = []
+
+            for name in BANDHAS:
+
+                a = result[
+                    "accuracy"
+                ][name]
+
+                accuracy_rows.append(
+                    {
+                        "Bandha": name,
+                        "Hits": a["hits"],
+                        "Tests": a["tests"],
+                        "Misses": a["misses"],
+                        "Accuracy":
+                            f"{a['accuracy']:.1f}%",
+                    }
+                )
+
+            result_column.controls.append(
+
+                ft.Row(
+                    [
+                        make_table(
+                            accuracy_rows,
+                            [
+                                "Bandha",
+                                "Hits",
+                                "Tests",
+                                "Misses",
+                                "Accuracy",
+                            ],
+                        )
+                    ],
+                    scroll=ft.ScrollMode.AUTO,
+                )
+            )
+
+            # ------------------------------------------------
+            # BANDHA SELECTOR
+            # ------------------------------------------------
+
+            result_column.controls.append(
+                ft.Divider()
+            )
+
+            result_column.controls.append(
+
+                ft.Text(
+                    "CHECK ONE BANDHA",
+                    size=20,
+                    weight=ft.FontWeight.BOLD,
+                )
+            )
+
+            result_column.controls.append(
+
+                ft.Row(
+                    [
+                        selected_bandha,
+
+                        ft.Text(
+                            "Change Bandha to "
+                            "recalculate the display "
+                            "for that Bandha.",
+                            size=13,
+                        ),
+                    ],
+                    wrap=True,
+                )
+            )
+
+            # ------------------------------------------------
+            # INITIAL SELECTED BANDHA
+            # ------------------------------------------------
+
+            initial_name = (
+                selected_bandha.value
+            )
+
+            if initial_name not in BANDHAS:
+                initial_name = "Saras"
+
+                selected_bandha.value = (
+                    initial_name
+                )
+
+            selected_section.controls.extend(
+
+                build_selected_bandha_section(
+                    result,
+                    initial_name,
+                )
+            )
+
+            result_column.controls.append(
+                selected_section
             )
 
             # ------------------------------------------------
             # PREVIOUS 9
             # ------------------------------------------------
 
-            result_area.controls.append(
+            result_column.controls.append(
+                ft.Divider()
+            )
+
+            result_column.controls.append(
 
                 ft.Text(
-
-                    "Previous 9 Trading Days",
-
-                    size=17,
-
-                    weight=
-                    ft.FontWeight.BOLD,
+                    "PREVIOUS 9 TRADING SESSIONS",
+                    size=20,
+                    weight=ft.FontWeight.BOLD,
                 )
             )
 
-            result_area.controls.append(
+            previous_rows = []
+
+            for item in result[
+                "previous"
+            ]:
+
+                previous_rows.append(
+                    {
+                        "Date":
+                            item["date"],
+
+                        "Close":
+                            item["close"],
+
+                        "Direction":
+                            direction_icon(
+                                item[
+                                    "direction"
+                                ]
+                            ),
+                    }
+                )
+
+            result_column.controls.append(
 
                 ft.Row(
-
                     [
-                        make_previous_table(
-                            previous
+                        make_table(
+                            previous_rows,
+                            [
+                                "Date",
+                                "Close",
+                                "Direction",
+                            ],
                         )
                     ],
-
-                    scroll=
-                    ft.ScrollMode.AUTO,
+                    scroll=ft.ScrollMode.AUTO,
                 )
             )
 
-            # ------------------------------------------------
-            # NEXT 9
-            # ------------------------------------------------
-
-            result_area.controls.append(
-
-                ft.Text(
-
-                    "Next 9 Signals",
-
-                    size=17,
-
-                    weight=
-                    ft.FontWeight.BOLD,
-                )
+            status.value = (
+                f"Completed: "
+                f"{len(data)} trading sessions."
             )
 
-            result_area.controls.append(
-
-                ft.Row(
-
-                    [
-                        make_next_table(
-                            next_signals,
-                            selected_bandha,
-                        )
-                    ],
-
-                    scroll=
-                    ft.ScrollMode.AUTO,
-                )
-            )
-
-            status_text.value = (
-                "Test completed successfully."
-            )
+            page.update()
 
         except Exception as ex:
 
-            status_text.value = (
-                f"Error: {ex}"
+            status.value = (
+                f"ERROR: "
+                f"{type(ex).__name__}: "
+                f"{ex}"
             )
 
-            result_area.controls.append(
+            page.update()
 
-                ft.Container(
+    # ========================================================
+    # RUN BUTTON
+    # ========================================================
 
-                    content=ft.Text(
-
-                        str(ex),
-
-                        color=ft.Colors.RED,
-                    ),
-
-                    padding=10,
-
-                    border=
-                    ft.Border.all(
-                        1,
-                        ft.Colors.RED,
-                    ),
-
-                    border_radius=8,
-                )
-            )
-
-        page.update()
-
-    # --------------------------------------------------------
-    # BANDHA CHANGE
-    # --------------------------------------------------------
-
-    def bandha_changed(e):
-
-        result = latest_result["value"]
-
-        if result is None:
-            return
-
-        selected_bandha = (
-            bandha_dropdown.value
-            or DEFAULT_BANDHA
-        )
-
-        selected_area.controls.clear()
-
-        selected_area.controls.append(
-
-            build_selected_bandha_section(
-
-                result,
-
-                selected_bandha,
-            )
-        )
-
-        page.update()
-
-    bandha_dropdown.on_change = (
-        bandha_changed
+    update_button = ft.Button(
+        content="UPDATE NSE DATA",
+        icon=ft.Icons.DOWNLOAD,
+        on_click=update_market_data,
     )
 
-    # --------------------------------------------------------
-    # RUN BUTTON
-    # --------------------------------------------------------
-
     run_button = ft.Button(
-
         content="RUN TEST",
-
         icon=ft.Icons.PLAY_ARROW,
-
         on_click=run_test,
     )
 
-    # --------------------------------------------------------
-    # INPUT ROWS
-    # --------------------------------------------------------
-
-    input_row_1 = ft.Row(
-
-        [
-            symbol_field,
-            hindi_field,
-        ],
-
-        spacing=8,
-    )
-
-    input_row_2 = ft.Row(
-
-        [
-            days_field,
-            bandha_dropdown,
-        ],
-
-        spacing=8,
-    )
-
-    # --------------------------------------------------------
+    # ========================================================
     # PAGE
-    # --------------------------------------------------------
+    # ========================================================
 
     page.add(
 
         ft.Text(
-
             APP_TITLE,
-
-            size=24,
-
-            weight=
-            ft.FontWeight.BOLD,
+            size=26,
+            weight=ft.FontWeight.BOLD,
         ),
 
         ft.Text(
-
-            "Experimental Sri Bhoovalaya stock research",
-
-            size=11,
-
-            color=
-            ft.Colors.GREY_600,
+            "Experimental Sri Bhoovalaya stock research"
         ),
 
-        input_row_1,
-
-        input_row_2,
+        ft.Divider(),
 
         ft.Row(
             [
-                run_button
-            ]
+                symbol,
+                hindi_name,
+            ],
+            wrap=True,
         ),
 
-        status_text,
+        ft.Row(
+            [
+                days_field,
+                update_button,
+                run_button,
+            ],
+            wrap=True,
+        ),
+
+        status,
 
         ft.Divider(),
 
-        selected_area,
+        summary,
 
         ft.Divider(),
 
-        result_area,
-
-        ft.Container(
-            height=25
-        ),
-
-        ft.Text(
-
-            "Note: Historical backtest accuracy is "
-            "experimental and does not guarantee "
-            "future market direction.",
-
-            size=10,
-
-            color=
-            ft.Colors.GREY_600,
-        ),
+        result_column,
     )
 
-
-# ============================================================
-# START APP
-# ============================================================
 
 if __name__ == "__main__":
     ft.run(main)
