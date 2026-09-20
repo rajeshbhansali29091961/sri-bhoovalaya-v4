@@ -1,702 +1,676 @@
 import json
 import os
+import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
-
-import requests
 
 
 # ============================================================
 # YAHOO FINANCE
 # ============================================================
 
-YAHOO_URLS = [
-    "https://query1.finance.yahoo.com/v8/finance/chart/",
-    "https://query2.finance.yahoo.com/v8/finance/chart/",
-]
+YAHOO_HOSTS = (
+    "query1.finance.yahoo.com",
+    "query2.finance.yahoo.com",
+)
+
+YAHOO_CHART_PATH = "/v8/finance/chart/{symbol}"
 
 
 # ============================================================
 # SETTINGS
 # ============================================================
 
-REQUEST_TIMEOUT = 20
+REQUEST_TIMEOUT = 15
 
-MAX_RETRIES = 4
+# Keep retries deliberately small. Repeated requests can make
+# an HTTP 429 situation worse rather than better.
+MAX_ROUNDS = 2
+RETRY_DELAY_SECONDS = 5
 
-# Wait approximately:
-# attempt 1 -> 3 seconds
-# attempt 2 -> 6 seconds
-# attempt 3 -> 12 seconds
-# attempt 4 -> 24 seconds
-RETRY_DELAYS = [3, 6, 12, 24]
+# Fresh cache is used without any network request.
+CACHE_FRESH_SECONDS = 6 * 3600
 
-# Cache lifetime.
-#
-# Historical daily data does not need to be downloaded
-# every time RUN TEST is pressed.
-CACHE_HOURS = 6
+# Stale cache is retained so the APK can still operate if Yahoo
+# temporarily returns HTTP 429 or is unavailable.
+MAX_STALE_SECONDS = 30 * 24 * 3600
+
+MIN_DAYS = 12
+MAX_DAYS = 730
 
 
 # ============================================================
-# CACHE DIRECTORY
+# ANDROID-SAFE CACHE LOCATION
 # ============================================================
 
 def _cache_directory():
+    """
+    Prefer Flet's application storage directory on Android.
+    Fall back to the user's home directory and finally /tmp.
+    """
+    candidates = []
+
+    flet_storage = os.environ.get("FLET_APP_STORAGE_DATA")
+    if flet_storage:
+        candidates.append(flet_storage)
 
     try:
-        base = os.path.expanduser(
-            "~"
-        )
-
-        path = os.path.join(
-            base,
+        candidates.append(os.path.join(
+            os.path.expanduser("~"),
             ".sri_bhoovalaya_cache",
-        )
-
-        os.makedirs(
-            path,
-            exist_ok=True,
-        )
-
-        return path
-
+        ))
     except Exception:
+        pass
 
-        return "."
+    candidates.append(os.path.join(
+        tempfile.gettempdir(),
+        "sri_bhoovalaya_cache",
+    ))
+
+    for path in candidates:
+        try:
+            os.makedirs(path, exist_ok=True)
+            test_file = os.path.join(path, ".write_test")
+            with open(test_file, "a", encoding="utf-8"):
+                pass
+            try:
+                os.remove(test_file)
+            except Exception:
+                pass
+            return path
+        except Exception:
+            continue
+
+    return "."
 
 
-def _cache_file(
-    symbol,
-    period_days,
-):
-
-    safe_symbol = (
-        symbol
-        .replace("/", "_")
-        .replace("\\", "_")
-        .replace(":", "_")
-    )
-
-    filename = (
-        f"{safe_symbol}_{period_days}.json"
+def _cache_file(symbol, period_days):
+    safe_symbol = "".join(
+        ch if ch.isalnum() else "_"
+        for ch in str(symbol).strip().upper()
     )
 
     return os.path.join(
         _cache_directory(),
-        filename,
+        f"{safe_symbol}_{int(period_days)}.json",
     )
 
 
 # ============================================================
-# DATE CONVERSION
+# DATE / CACHE
 # ============================================================
 
-def _to_date(timestamp):
-
-    return datetime.fromtimestamp(
-        int(timestamp)
+def _to_date(timestamp, offset_seconds=0):
+    """
+    Yahoo timestamps are UTC epoch seconds.
+    Apply the exchange offset returned by Yahoo when available.
+    """
+    epoch = datetime(1970, 1, 1)
+    return (
+        epoch
+        + timedelta(
+            seconds=int(timestamp) + int(offset_seconds)
+        )
     ).date()
 
 
-# ============================================================
-# CACHE LOAD
-# ============================================================
-
-def _load_cache(
-    symbol,
-    period_days,
-):
-
-    path = _cache_file(
-        symbol,
-        period_days,
-    )
+def _cache_load(symbol, period_days):
+    """
+    Return:
+        (data, age_seconds)
+    or None.
+    """
+    path = _cache_file(symbol, period_days)
 
     try:
-
         if not os.path.exists(path):
             return None
 
-        modified = os.path.getmtime(
-            path
-        )
+        with open(path, "r", encoding="utf-8") as f:
+            blob = json.load(f)
 
-        age_hours = (
-            time.time() - modified
-        ) / 3600.0
-
-        if age_hours > CACHE_HOURS:
+        if not isinstance(blob, dict):
             return None
 
-        with open(
-            path,
-            "r",
-            encoding="utf-8",
-        ) as f:
+        saved_at = float(blob.get("saved_at", 0))
+        rows = blob.get("rows", [])
 
-            saved = json.load(f)
-
-        if not isinstance(
-            saved,
-            list,
-        ):
+        if not saved_at or not isinstance(rows, list):
             return None
 
         data = []
 
-        for row in saved:
-
-            if not isinstance(
-                row,
-                dict,
-            ):
+        for row in rows:
+            if not isinstance(row, dict):
                 continue
 
-            if "date" not in row:
+            if "date" not in row or "close" not in row:
                 continue
 
             item = dict(row)
 
-            # JSON stores dates as strings.
             item["date"] = datetime.strptime(
-                item["date"],
+                str(item["date"]),
                 "%Y-%m-%d",
             ).date()
 
+            item["close"] = float(item["close"])
+
+            # These are not essential to the current engine, but
+            # keeping them makes the module compatible with the
+            # previous market_data.py interface.
+            item["open"] = float(item.get("open", item["close"]))
+            item["high"] = float(item.get("high", item["close"]))
+            item["low"] = float(item.get("low", item["close"]))
+            item["volume"] = int(item.get("volume", 0))
+
             data.append(item)
+
+        data.sort(key=lambda x: x["date"])
 
         if not data:
             return None
 
-        return data
+        age = max(0.0, time.time() - saved_at)
+
+        return data, age
 
     except Exception:
-
         return None
 
 
-# ============================================================
-# CACHE SAVE
-# ============================================================
-
-def _save_cache(
-    symbol,
-    period_days,
-    data,
-):
-
-    path = _cache_file(
-        symbol,
-        period_days,
-    )
+def _cache_save(symbol, period_days, data):
+    path = _cache_file(symbol, period_days)
 
     try:
-
-        serializable = []
+        rows = []
 
         for row in data:
-
             item = dict(row)
 
-            date_value = item.get(
-                "date"
-            )
+            date_value = item.get("date")
 
-            if hasattr(
-                date_value,
-                "isoformat",
-            ):
-                item["date"] = (
-                    date_value.isoformat()
-                )
+            if hasattr(date_value, "isoformat"):
+                item["date"] = date_value.isoformat()
+            else:
+                item["date"] = str(date_value)
 
-            serializable.append(
-                item
-            )
+            rows.append(item)
+
+        blob = {
+            "saved_at": time.time(),
+            "rows": rows,
+        }
+
+        temporary = path + ".tmp"
 
         with open(
-            path,
+            temporary,
             "w",
             encoding="utf-8",
         ) as f:
+            json.dump(blob, f)
 
-            json.dump(
-                serializable,
-                f,
-            )
+        # Atomic replacement where supported.
+        os.replace(temporary, path)
 
     except Exception:
-
-        # Cache failure should never
-        # stop the application.
-        pass
+        try:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        except Exception:
+            pass
 
 
 # ============================================================
-# HEADERS
+# YAHOO REQUEST
 # ============================================================
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 "
-        "(Linux; Android 10) "
+        "Mozilla/5.0 (Linux; Android 13) "
         "AppleWebKit/537.36 "
         "(KHTML, like Gecko) "
-        "Chrome/120.0 Mobile Safari/537.36"
+        "Chrome/124.0 Mobile Safari/537.36"
     ),
-
-    "Accept": (
-        "application/json,text/plain,*/*"
-    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://finance.yahoo.com/",
 }
 
 
-# ============================================================
-# YAHOO DOWNLOAD
-# ============================================================
+def _request_history(host, symbol, days):
+    """
+    Make ONE request to ONE Yahoo endpoint.
+    """
+    now = int(time.time())
 
-def _download_from_yahoo(
-    symbol,
-    period_days,
-):
-
+    # Enough calendar days for approximately `days` trading sessions.
     calendar_days = max(
-        int(period_days * 1.7),
+        int(days * 7 / 5) + 14,
         30,
     )
 
-    end_date = datetime.utcnow()
-
-    start_date = (
-        end_date
-        - timedelta(
-            days=calendar_days
-        )
-    )
-
-    period1 = int(
-        start_date.timestamp()
-    )
-
-    period2 = int(
-        end_date.timestamp()
-    )
-
-    params = {
-        "period1": period1,
-        "period2": period2,
+    params = urllib.parse.urlencode({
+        "period1": now - calendar_days * 86400,
+        "period2": now,
         "interval": "1d",
         "events": "history",
         "includeAdjustedClose": "true",
-    }
+    })
 
-    last_error = None
+    encoded_symbol = urllib.parse.quote(
+        symbol,
+        safe="",
+    )
 
-    # Try query1 and then query2.
-    for base_url in YAHOO_URLS:
+    url = (
+        "https://"
+        + host
+        + YAHOO_CHART_PATH.format(encoded_symbol)
+        + "?"
+        + params
+    )
 
-        url = (
-            base_url
-            + symbol
+    request = urllib.request.Request(
+        url,
+        headers=HEADERS,
+    )
+
+    with urllib.request.urlopen(
+        request,
+        timeout=REQUEST_TIMEOUT,
+    ) as response:
+
+        status = getattr(
+            response,
+            "status",
+            200,
         )
 
-        for attempt in range(
-            MAX_RETRIES
-        ):
+        if status != 200:
+            raise RuntimeError(
+                f"HTTP {status}"
+            )
+
+        raw = response.read().decode(
+            "utf-8",
+            errors="replace",
+        )
+
+    payload = json.loads(raw)
+
+    chart = (payload or {}).get("chart") or {}
+
+    error = chart.get("error")
+
+    if error:
+        description = (
+            error.get("description")
+            if isinstance(error, dict)
+            else str(error)
+        )
+
+        raise RuntimeError(
+            str(description or "Yahoo Finance error")
+        )
+
+    results = chart.get("result") or []
+
+    if not results:
+        raise RuntimeError(
+            "No Yahoo Finance result returned."
+        )
+
+    result = results[0]
+
+    timestamps = result.get("timestamp") or []
+
+    quote_list = (
+        (result.get("indicators") or {})
+        .get("quote")
+        or []
+    )
+
+    if not quote_list:
+        raise RuntimeError(
+            "No Yahoo quote data returned."
+        )
+
+    quote = quote_list[0]
+
+    opens = quote.get("open") or []
+    highs = quote.get("high") or []
+    lows = quote.get("low") or []
+    closes = quote.get("close") or []
+    volumes = quote.get("volume") or []
+
+    meta = result.get("meta") or {}
+
+    # Yahoo normally supplies gmtoffset. For NSE symbols this
+    # should be +19800 (IST). If absent, use IST.
+    offset = meta.get("gmtoffset")
+
+    if offset is None:
+        offset = 19800
+
+    data = []
+
+    for i, timestamp in enumerate(timestamps):
+
+        if i >= len(closes):
+            continue
+
+        close = closes[i]
+
+        if close is None:
+            continue
+
+        open_value = (
+            opens[i]
+            if i < len(opens)
+            and opens[i] is not None
+            else close
+        )
+
+        high_value = (
+            highs[i]
+            if i < len(highs)
+            and highs[i] is not None
+            else close
+        )
+
+        low_value = (
+            lows[i]
+            if i < len(lows)
+            and lows[i] is not None
+            else close
+        )
+
+        volume_value = (
+            volumes[i]
+            if i < len(volumes)
+            and volumes[i] is not None
+            else 0
+        )
+
+        data.append({
+            "date": _to_date(
+                timestamp,
+                offset,
+            ),
+            "open": float(open_value),
+            "high": float(high_value),
+            "low": float(low_value),
+            "close": float(close),
+            "volume": int(volume_value),
+        })
+
+    data.sort(
+        key=lambda x: x["date"]
+    )
+
+    if len(data) > days:
+        data = data[-days:]
+
+    if not data:
+        raise RuntimeError(
+            "Yahoo Finance returned no usable price data."
+        )
+
+    return data
+
+
+def _download_history(symbol, days):
+    """
+    Controlled Yahoo download.
+
+    Unlike the previous engine, this does NOT repeatedly hammer
+    Yahoo. Each round tries query1 and query2 once.
+    """
+    last_error = "Unknown Yahoo Finance error"
+
+    for round_no in range(MAX_ROUNDS):
+
+        for host in YAHOO_HOSTS:
 
             try:
-
-                response = requests.get(
-                    url,
-                    params=params,
-                    headers=HEADERS,
-                    timeout=REQUEST_TIMEOUT,
+                return _request_history(
+                    host,
+                    symbol,
+                    days,
                 )
 
-                # ------------------------------------------------
-                # HTTP 429
-                # ------------------------------------------------
-
-                if response.status_code == 429:
-
-                    last_error = (
-                        "Yahoo Finance returned "
-                        "HTTP 429 Too Many Requests."
-                    )
-
-                    if attempt < MAX_RETRIES - 1:
-
-                        wait_seconds = (
-                            RETRY_DELAYS[
-                                attempt
-                            ]
-                        )
-
-                        time.sleep(
-                            wait_seconds
-                        )
-
-                        continue
-
-                    # Try the other Yahoo endpoint.
-                    break
-
-                # ------------------------------------------------
-                # Other HTTP errors
-                # ------------------------------------------------
-
-                response.raise_for_status()
-
-                payload = response.json()
-
-                chart = payload.get(
-                    "chart",
-                    {},
-                )
-
-                error = chart.get(
-                    "error"
-                )
-
-                if error:
-
-                    description = error.get(
-                        "description",
-                        "Yahoo Finance error",
-                    )
-
-                    last_error = (
-                        str(description)
-                    )
-
-                    break
-
-                results = chart.get(
-                    "result"
-                )
-
-                if not results:
-
-                    last_error = (
-                        "No Yahoo Finance result returned."
-                    )
-
-                    break
-
-                result = results[0]
-
-                timestamps = result.get(
-                    "timestamp",
-                    [],
-                )
-
-                quote_list = (
-                    result
-                    .get(
-                        "indicators",
-                        {},
-                    )
-                    .get(
-                        "quote",
-                        [],
-                    )
-                )
-
-                if not quote_list:
-
-                    last_error = (
-                        "No quote data returned."
-                    )
-
-                    break
-
-                quote = quote_list[0]
-
-                opens = quote.get(
-                    "open",
-                    [],
-                )
-
-                highs = quote.get(
-                    "high",
-                    [],
-                )
-
-                lows = quote.get(
-                    "low",
-                    [],
-                )
-
-                closes = quote.get(
-                    "close",
-                    [],
-                )
-
-                volumes = quote.get(
-                    "volume",
-                    [],
-                )
-
-                data = []
-
-                for i, timestamp in enumerate(
-                    timestamps
-                ):
-
-                    if i >= len(closes):
-                        continue
-
-                    close = closes[i]
-
-                    if close is None:
-                        continue
-
-                    open_value = (
-                        opens[i]
-                        if i < len(opens)
-                        else None
-                    )
-
-                    high_value = (
-                        highs[i]
-                        if i < len(highs)
-                        else None
-                    )
-
-                    low_value = (
-                        lows[i]
-                        if i < len(lows)
-                        else None
-                    )
-
-                    volume_value = (
-                        volumes[i]
-                        if i < len(volumes)
-                        else 0
-                    )
-
-                    if open_value is None:
-                        open_value = close
-
-                    if high_value is None:
-                        high_value = close
-
-                    if low_value is None:
-                        low_value = close
-
-                    if volume_value is None:
-                        volume_value = 0
-
-                    data.append(
-                        {
-                            "date": _to_date(
-                                timestamp
-                            ),
-
-                            "open": float(
-                                open_value
-                            ),
-
-                            "high": float(
-                                high_value
-                            ),
-
-                            "low": float(
-                                low_value
-                            ),
-
-                            "close": float(
-                                close
-                            ),
-
-                            "volume": int(
-                                volume_value
-                            ),
-                        }
-                    )
-
-                # Keep chronological order.
-                data.sort(
-                    key=lambda x: x["date"]
-                )
-
-                # Return requested number of
-                # trading sessions.
-                if len(data) > period_days:
-
-                    data = data[
-                        -period_days:
-                    ]
-
-                if not data:
-
-                    last_error = (
-                        "Yahoo Finance returned "
-                        "no usable price data."
-                    )
-
-                    break
-
-                return data
-
-            except requests.RequestException as ex:
-
-                last_error = str(ex)
-
-                if attempt < MAX_RETRIES - 1:
-
-                    wait_seconds = (
-                        RETRY_DELAYS[
-                            attempt
-                        ]
-                    )
-
-                    time.sleep(
-                        wait_seconds
-                    )
-
-                    continue
-
-                break
-
-            except ValueError as ex:
+            except urllib.error.HTTPError as ex:
 
                 last_error = (
-                    "Invalid Yahoo Finance response: "
+                    f"HTTP Error {ex.code}: "
+                    f"{ex.reason}"
+                )
+
+                # 429 means rate-limited. Try the other endpoint
+                # once, then stop rather than making many requests.
+                if ex.code == 429:
+                    continue
+
+                # Temporary server errors can be tried again.
+                if ex.code in (
+                    500,
+                    502,
+                    503,
+                    504,
+                ):
+                    continue
+
+                # Other errors are normally not helped by retrying.
+                raise RuntimeError(last_error)
+
+            except urllib.error.URLError as ex:
+
+                last_error = (
+                    "Network error: "
+                    + str(ex.reason)
+                )
+
+                continue
+
+            except TimeoutError as ex:
+
+                last_error = (
+                    "Network timeout: "
                     + str(ex)
                 )
 
-                break
+                continue
+
+            except json.JSONDecodeError as ex:
+
+                last_error = (
+                    "Yahoo returned an invalid response: "
+                    + str(ex)
+                )
+
+                continue
 
             except Exception as ex:
 
                 last_error = str(ex)
+                continue
 
-                break
+        if round_no < MAX_ROUNDS - 1:
+            time.sleep(
+                RETRY_DELAY_SECONDS
+            )
 
-    # Both Yahoo endpoints failed.
-    raise RuntimeError(
-        last_error
-        or "Unable to download Yahoo Finance data."
-    )
+    raise RuntimeError(last_error)
 
 
 # ============================================================
-# STOCK HISTORY
+# PUBLIC PRICE HISTORY
 # ============================================================
 
-def get_stock_history(
+def fetch_price_history_ex(
     symbol,
-    period_days=30,
+    days=60,
+    timezone_name="Asia/Kolkata",
 ):
-
     """
-    Download historical daily OHLC data.
-
-    Uses local cache first.
-
     Returns:
 
-        [
-            {
-                "date": date,
-                "open": float,
-                "high": float,
-                "low": float,
-                "close": float,
-                "volume": int,
-            }
-        ]
+        (rows, source)
+
+    source:
+        "live"          fresh Yahoo download
+        "cache"         fresh local cache
+        "stale-cache"   older cache used because online
+                        download failed
+
+    The timezone argument is retained for compatibility with
+    bhoovalaya_engine.py. Yahoo's exchange date/offset is used
+    for the actual daily dates.
     """
 
-    symbol = (
-        symbol
-        .strip()
-        .upper()
-    )
+    symbol = str(symbol or "").strip().upper()
 
     if not symbol:
-
         raise ValueError(
             "Stock symbol is empty."
         )
 
     try:
-
-        period_days = int(
-            period_days
-        )
-
+        days = int(days)
     except Exception:
+        days = 60
 
-        period_days = 30
-
-    if period_days < 1:
-
-        period_days = 30
-
-    # --------------------------------------------------------
-    # FIRST: USE CACHE
-    # --------------------------------------------------------
-
-    cached = _load_cache(
-        symbol,
-        period_days,
+    days = max(
+        MIN_DAYS,
+        min(days, MAX_DAYS),
     )
 
+    cached = _cache_load(
+        symbol,
+        days,
+    )
+
+    # --------------------------------------------------------
+    # Fresh cache: NO network request.
+    # --------------------------------------------------------
     if cached:
 
-        return cached
+        cached_rows, age = cached
+
+        if age <= CACHE_FRESH_SECONDS:
+            return (
+                cached_rows,
+                "cache",
+            )
 
     # --------------------------------------------------------
-    # DOWNLOAD
+    # Try online source only when cache is not fresh.
     # --------------------------------------------------------
+    try:
 
-    data = _download_from_yahoo(
-        symbol,
-        period_days,
-    )
+        rows = _download_history(
+            symbol,
+            days,
+        )
 
-    # --------------------------------------------------------
-    # SAVE CACHE
-    # --------------------------------------------------------
+        if len(rows) < MIN_DAYS:
+            raise RuntimeError(
+                f"Only {len(rows)} price rows found "
+                f"for {symbol}; at least "
+                f"{MIN_DAYS} are required."
+            )
 
-    _save_cache(
-        symbol,
-        period_days,
-        data,
-    )
+        _cache_save(
+            symbol,
+            days,
+            rows,
+        )
 
-    return data
+        return (
+            rows,
+            "live",
+        )
+
+    except Exception as online_error:
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # If Yahoo returns 429 but we have usable older data,
+        # continue with that data instead of crashing.
+        # ----------------------------------------------------
+        if cached:
+
+            cached_rows, age = cached
+
+            if age <= MAX_STALE_SECONDS:
+
+                return (
+                    cached_rows,
+                    "stale-cache",
+                )
+
+        raise ValueError(
+            f"Could not download price data for "
+            f"{symbol}: {online_error}. "
+            f"No usable cached data is available."
+        )
 
 
-# ============================================================
-# LAST CLOSE
-# ============================================================
-
-def get_last_close(
+def get_stock_history(
     symbol,
+    period_days=30,
 ):
-
     """
-    Convenience function.
-    """
+    Compatibility function for existing code.
 
+    Returns only the data list.
+    """
+    rows, _source = fetch_price_history_ex(
+        symbol,
+        days=period_days,
+        timezone_name="Asia/Kolkata",
+    )
+
+    return rows
+
+
+def get_last_close(symbol):
+    """
+    Compatibility function.
+    """
     data = get_stock_history(
         symbol,
         period_days=5,
     )
 
     if not data:
-
         return None
 
     return data[-1]["close"]
 
 
+def fetch_price_history(
+    symbol,
+    days=60,
+    timezone_name="Asia/Kolkata",
+):
+    """
+    Compatibility wrapper returning only rows.
+    """
+    return fetch_price_history_ex(
+        symbol,
+        days=days,
+        timezone_name=timezone_name,
+    )[0]
+
+
 # ============================================================
-# DESKTOP TEST
+# DESKTOP / ANDROID TEST
 # ============================================================
 
 if __name__ == "__main__":
@@ -705,17 +679,24 @@ if __name__ == "__main__":
 
     try:
 
-        data = get_stock_history(
+        data, source = fetch_price_history_ex(
             symbol,
-            period_days=20,
+            days=20,
+            timezone_name="Asia/Kolkata",
         )
 
         print(
-            f"Downloaded {len(data)} sessions."
+            "Source:",
+            source,
+        )
+
+        print(
+            "Downloaded/loaded:",
+            len(data),
+            "sessions",
         )
 
         for row in data:
-
             print(
                 row["date"],
                 row["close"],
