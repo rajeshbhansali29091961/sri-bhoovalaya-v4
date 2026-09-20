@@ -1,22 +1,4 @@
-"""
-market_data.py - NSE India price history for Sri Bhoovalaya.
- 
-    NSE India  ->  CSV file on the device  ->  list of daily closes
- 
-Public functions (exactly what main.py calls):
- 
-    get_stock_history(symbol, period_days=60, force_refresh=False)
-        -> [{"date": datetime.date, "close": float}, ...]
-    update_stock_history(symbol, period_days=60)
-        -> (rows, csv_path)          always downloads from NSE
-    get_cache_csv_path(symbol)
-        -> path of the saved CSV file
- 
-Download order: nselib (if it is bundled in the app), then the same
-NSE report fetched directly with the standard library.
-Yahoo Finance is not used.
-"""
- 
+
 from datetime import datetime, timedelta, timezone
 import csv
 import gzip
