@@ -1,526 +1,668 @@
-
-# market_data.py
-# NSE UDiFF Bhavcopy downloader for Sri Bhoovalaya V5
-#
-# Uses NSE's current UDiFF daily Bhavcopy archive:
-# https://nsearchives.nseindia.com/content/cm/
-#
-# It does NOT call the NSE homepage or the obsolete
-# /api/historical/cm/equity endpoint.
-#
-# Data is saved locally as:
-#   RELIANCE_NSE.csv
-#
-# The CSV contains:
-#   date, open, high, low, close, volume
-#
-# This module can be used by the Flet desktop/web build and by
-# an Android build when the NSE archive is reachable.
-
-from __future__ import annotations
-
+et data · PY
+"""
+market_data.py - NSE India price history for Sri Bhoovalaya.
+ 
+    NSE India  ->  CSV file on the device  ->  list of daily closes
+ 
+Public functions (exactly what main.py calls):
+ 
+    get_stock_history(symbol, period_days=60, force_refresh=False)
+        -> [{"date": datetime.date, "close": float}, ...]
+    update_stock_history(symbol, period_days=60)
+        -> (rows, csv_path)          always downloads from NSE
+    get_cache_csv_path(symbol)
+        -> path of the saved CSV file
+ 
+Download order: nselib (if it is bundled in the app), then the same
+NSE report fetched directly with the standard library.
+Yahoo Finance is not used.
+"""
+ 
+from datetime import datetime, timedelta, timezone
 import csv
+import gzip
+import http.cookiejar
 import io
 import os
 import re
+import ssl
+import tempfile
 import time
-import zipfile
-from datetime import date, datetime, timedelta
-from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
-
-
-NSE_ARCHIVE_BASE = (
-    "https://nsearchives.nseindia.com/content/cm/"
+import urllib.error
+import urllib.parse
+import urllib.request
+ 
+ 
+# Set to False to skip nselib and always use the direct download.
+USE_NSELIB = True
+ 
+NSE_ORIGIN_URL = "https://www.nseindia.com/report-detail/eq_security"
+ 
+NSE_API_URL = (
+    "https://www.nseindia.com/api/historicalOR/"
+    "generateSecurityWiseHistoricalData?"
 )
-
-# Current NSE UDiFF final Bhavcopy naming convention.
-# Example:
-# BhavCopy_NSE_CM_0_0_0_20260918_F_0000.csv.zip
-NSE_FILE_TEMPLATE = (
-    "BhavCopy_NSE_CM_0_0_0_{yyyymmdd}_F_0000.csv.zip"
+ 
+# Same browser-like headers nselib sends (Accept-Encoding limited
+# to gzip, which is the only compression handled below).
+NSE_PAGE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+    "Accept-Encoding": "gzip",
+}
+ 
+NSE_API_HEADERS = {
+    "User-Agent": NSE_PAGE_HEADERS["User-Agent"],
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+    "Accept-Encoding": "gzip",
+    "Referer": "https://www.nseindia.com/",
+    "Connection": "keep-alive",
+}
+ 
+DMY = "%d-%m-%Y"
+ 
+# NSE allows at most one year per request.
+NSE_MAX_CHUNK_DAYS = 364
+ 
+# 10 sessions are needed for the "previous 9" table,
+# a few more give the backtest something to work with.
+MIN_DAYS = 12
+MAX_DAYS = 730
+ 
+# A CSV downloaded less than this long ago is reused as it is.
+CACHE_FRESH_SECONDS = 2 * 3600
+ 
+# Download attempts, and the pause between them.
+FETCH_ATTEMPTS = 3
+RETRY_PAUSE_SECONDS = 2.0
+ 
+RETRY_CODES = (401, 403, 429, 500, 502, 503, 504)
+ 
+_DATE_FORMATS = (
+    "%d-%b-%Y",
+    "%d-%B-%Y",
+    "%d-%m-%Y",
+    "%Y-%m-%d",
+    "%d/%m/%Y",
 )
-
-REQUEST_TIMEOUT = 20
-DOWNLOAD_PAUSE_SECONDS = 0.35
-
-# How many calendar days to inspect when the user asks for N trading days.
-# 2.5x is normally enough; 4x is used as a safety ceiling.
-CALENDAR_MULTIPLIER = 2.8
-MAX_CALENDAR_DAYS = 500
-
-
-def _storage_directory() -> Path:
+ 
+ 
+# ------------------------------------------------------------
+# symbol / dates
+# ------------------------------------------------------------
+ 
+def normalize_nse_symbol(symbol):
     """
-    Choose a writable directory.
-
-    FLET_APP_STORAGE_DATA is useful for Flet mobile builds.
-    On desktop/Codespaces, the project directory is easiest to inspect.
+    "RELIANCE.NS" / "reliance" / "NSE:RELIANCE"  ->  "RELIANCE"
     """
-    candidates = []
-
-    flet_dir = os.environ.get("FLET_APP_STORAGE_DATA")
-    if flet_dir:
-        candidates.append(Path(flet_dir))
-
-    candidates.append(Path.cwd() / "data")
-    candidates.append(Path.home() / ".sri_bhoovalaya_data")
-    candidates.append(Path("/tmp") / "sri_bhoovalaya_data")
-
-    for folder in candidates:
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-            test = folder / ".write_test"
-            test.write_text("ok", encoding="utf-8")
-            test.unlink(missing_ok=True)
-            return folder
-        except Exception:
-            continue
-
-    raise OSError("No writable data directory is available.")
-
-
-def _symbol_clean(symbol: str) -> str:
-    s = str(symbol or "").strip().upper()
+ 
+    s = (symbol or "").strip().upper()
+ 
+    if s.startswith("NSE:"):
+        s = s[4:]
+ 
+    if s.endswith(".BO") or s.endswith(".BSE"):
+        raise ValueError(
+            "BSE symbols are not supported - NSE data only. "
+            "Use the NSE symbol, for example RELIANCE."
+        )
+ 
     if s.endswith(".NS"):
         s = s[:-3]
-    if not re.fullmatch(r"[A-Z0-9&._-]+", s):
-        raise ValueError(f"Invalid NSE symbol: {symbol}")
+ 
+    if not s:
+        raise ValueError("Stock symbol is empty.")
+ 
+    if not re.fullmatch(r"[A-Z0-9&_\-]+", s):
+        raise ValueError(
+            f"'{s}' is not a valid NSE symbol."
+        )
+ 
     return s
-
-
-def _local_filename(symbol: str) -> Path:
-    return _storage_directory() / f"{_symbol_clean(symbol)}_NSE.csv"
-
-
-def _http_get(url: str) -> bytes:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/153.0 Safari/537.36"
-        ),
-        "Accept": "*/*",
-        "Accept-Encoding": "identity",
-        "Connection": "close",
-    }
-    req = Request(url, headers=headers, method="GET")
-    with urlopen(req, timeout=REQUEST_TIMEOUT) as response:
-        return response.read()
-
-
-def _parse_number(value):
-    if value is None:
+ 
+ 
+def _india_today():
+    """Today's date in IST (UTC+5:30), no timezone database needed."""
+ 
+    return (
+        datetime.now(timezone.utc)
+        + timedelta(hours=5, minutes=30)
+    ).date()
+ 
+ 
+# ------------------------------------------------------------
+# CSV parsing
+# ------------------------------------------------------------
+ 
+def _to_float(text):
+ 
+    if text is None:
         return None
-    s = str(value).strip().replace(",", "")
-    if not s or s.upper() in {"NA", "NULL", "N/A", "-"}:
+ 
+    t = str(text).replace(",", "").replace('"', "").strip()
+ 
+    if t in ("", "-", "nan", "NaN", "None"):
         return None
+ 
     try:
-        return float(s)
+        return float(t)
     except ValueError:
         return None
-
-
-def _normalise_date(value, fallback: date):
-    if value is None:
-        return fallback
-
-    s = str(value).strip()
-
-    # UDiFF normally uses YYYY-MM-DD.
-    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d-%m-%Y", "%d/%m/%Y"):
+ 
+ 
+def _to_date(text):
+ 
+    t = str(text or "").strip()
+ 
+    for fmt in _DATE_FORMATS:
         try:
-            return datetime.strptime(s, fmt).date()
+            return datetime.strptime(t, fmt).date()
         except ValueError:
-            pass
-
-    # Sometimes the value may contain a timestamp.
-    if len(s) >= 10:
-        try:
-            return datetime.strptime(s[:10], "%Y-%m-%d").date()
-        except ValueError:
-            pass
-
-    return fallback
-
-
-def _find_column(fieldnames, candidates):
-    lookup = {}
-    for f in fieldnames or []:
-        key = str(f).strip().lower()
-        lookup[key] = f
-
-    for candidate in candidates:
-        found = lookup.get(candidate.lower())
-        if found is not None:
-            return found
-
+            continue
+ 
     return None
-
-
-def _parse_bhavcopy_zip(raw: bytes, requested_date: date, symbol: str):
+ 
+ 
+def parse_nse_csv(text):
     """
-    Read the UDiFF CSV inside the ZIP and return one row for the requested
-    NSE equity symbol.
+    Reads an NSE security-wise price CSV (raw NSE file or the
+    nselib DataFrame saved with to_csv) into
+    [{"date": datetime.date, "close": float}, ...]
+    ordered oldest -> newest.
     """
-    clean_symbol = _symbol_clean(symbol)
-
-    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-        names = [
-            n for n in zf.namelist()
-            if not n.endswith("/") and n.lower().endswith(".csv")
-        ]
-
-        if not names:
-            raise ValueError("NSE ZIP contains no CSV file.")
-
-        # Prefer a file whose name looks like BhavCopy.
-        names.sort(key=lambda n: ("bhavcopy" not in n.lower(), n))
-        csv_name = names[0]
-
-        content = zf.read(csv_name)
-
-    # UDiFF CSV is normally UTF-8.
-    text = content.decode("utf-8-sig", errors="replace")
-    reader = csv.DictReader(io.StringIO(text))
-
-    if not reader.fieldnames:
-        raise ValueError("NSE CSV has no header.")
-
-    # Current UDiFF field names.
-    symbol_col = _find_column(
-        reader.fieldnames,
-        ["TckrSymb", "SYMBOL", "Symbol"],
-    )
-    date_col = _find_column(
-        reader.fieldnames,
-        ["TradDt", "TIMESTAMP", "Date", "DATE"],
-    )
-    open_col = _find_column(
-        reader.fieldnames,
-        ["OpnPric", "OPEN", "Open"],
-    )
-    high_col = _find_column(
-        reader.fieldnames,
-        ["HghPric", "HIGH", "High"],
-    )
-    low_col = _find_column(
-        reader.fieldnames,
-        ["LwPric", "LOW", "Low"],
-    )
-    close_col = _find_column(
-        reader.fieldnames,
-        ["ClsPric", "CLOSE", "Close"],
-    )
-    volume_col = _find_column(
-        reader.fieldnames,
-        ["TtlTradgVol", "TOTTRDQTY", "Volume", "VOLUME"],
-    )
-
-    missing = []
-    for name, col in (
-        ("symbol", symbol_col),
-        ("open", open_col),
-        ("high", high_col),
-        ("low", low_col),
-        ("close", close_col),
-    ):
-        if col is None:
-            missing.append(name)
-
-    if missing:
+ 
+    reader = csv.reader(io.StringIO(text or ""))
+ 
+    date_i = close_i = series_i = None
+    header_found = False
+ 
+    picked = []
+ 
+    for cells in reader:
+ 
+        if not cells:
+            continue
+ 
+        if not header_found:
+ 
+            names = [
+                c.replace("\ufeff", "")
+                .replace(" ", "")
+                .strip()
+                .lower()
+                for c in cells
+            ]
+ 
+            if "date" in names:
+                for key in (
+                    "closeprice",
+                    "close",
+                    "closingprice",
+                ):
+                    if key in names:
+                        date_i = names.index("date")
+                        close_i = names.index(key)
+                        series_i = (
+                            names.index("series")
+                            if "series" in names
+                            else None
+                        )
+                        header_found = True
+                        break
+ 
+            # Anything before the header row is ignored.
+            continue
+ 
+        # A header repeated in the middle (joined chunks) is skipped.
+        if len(cells) <= max(date_i, close_i):
+            continue
+ 
+        d = _to_date(cells[date_i])
+        c = _to_float(cells[close_i])
+ 
+        if d is None or c is None:
+            continue
+ 
+        series = (
+            cells[series_i].strip().upper()
+            if series_i is not None and series_i < len(cells)
+            else ""
+        )
+ 
+        picked.append((d, c, series))
+ 
+    if not header_found:
         raise ValueError(
-            "NSE CSV format was not recognised. Missing columns: "
-            + ", ".join(missing)
+            "The NSE file has no Date / Close Price columns."
         )
-
-    for row in reader:
-        row_symbol = str(row.get(symbol_col, "")).strip().upper()
-        if row_symbol != clean_symbol:
-            continue
-
-        d = _normalise_date(
-            row.get(date_col) if date_col else None,
-            requested_date,
+ 
+    if not picked:
+        raise ValueError(
+            "NSE returned no price rows for this symbol "
+            "(check the symbol name)."
         )
-
-        close = _parse_number(row.get(close_col))
-        if close is None:
-            continue
-
-        return {
-            "date": d.isoformat(),
-            "open": _parse_number(row.get(open_col)),
-            "high": _parse_number(row.get(high_col)),
-            "low": _parse_number(row.get(low_col)),
-            "close": close,
-            "volume": _parse_number(row.get(volume_col))
-            if volume_col else 0,
-        }
-
-    return None
-
-
-def _download_one_day(symbol: str, day: date):
-    yyyymmdd = day.strftime("%Y%m%d")
-    filename = NSE_FILE_TEMPLATE.format(yyyymmdd=yyyymmdd)
-    url = NSE_ARCHIVE_BASE + filename
-
-    try:
-        raw = _http_get(url)
-    except HTTPError as exc:
-        if exc.code in (403, 404):
-            # 404 is normal for weekends/holidays or a missing archive.
-            # 403 means the server/cloud IP refused this direct file.
-            return None, f"HTTP {exc.code}"
-        return None, f"HTTP {exc.code}"
-    except (URLError, TimeoutError, OSError) as exc:
-        return None, str(exc)
-
-    try:
-        row = _parse_bhavcopy_zip(raw, day, symbol)
-        return row, None
-    except (zipfile.BadZipFile, ValueError, UnicodeError) as exc:
-        return None, f"parse error: {exc}"
-
-
-def _save_rows(path: Path, rows):
-    rows = sorted(rows, key=lambda r: r["date"])
-
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["date", "open", "high", "low", "close", "volume"],
-        )
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-
-    os.replace(tmp, path)
-
-
-def _load_rows(path: Path):
-    if not path.exists():
-        return []
-
-    rows = []
-    with path.open("r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-
-        for r in reader:
-            try:
-                d = str(r["date"]).strip()
-                close = float(r["close"])
-            except (KeyError, TypeError, ValueError):
-                continue
-
-            rows.append(
-                {
-                    "date": d,
-                    "open": _parse_number(r.get("open")),
-                    "high": _parse_number(r.get("high")),
-                    "low": _parse_number(r.get("low")),
-                    "close": close,
-                    "volume": _parse_number(r.get("volume")) or 0,
-                }
-            )
-
-    return sorted(rows, key=lambda r: r["date"])
-
-
-def update_nse_history(symbol: str, days: int = 30):
+ 
+    # Regular equity (EQ) rows only, when the file has them.
+    if any(item[2] == "EQ" for item in picked):
+        picked = [item for item in picked if item[2] == "EQ"]
+ 
+    by_date = {}
+ 
+    for d, c, _ in picked:
+        by_date[d] = c
+ 
+    return [
+        {"date": d, "close": by_date[d]}
+        for d in sorted(by_date)
+    ]
+ 
+ 
+# ------------------------------------------------------------
+# local CSV storage
+# ------------------------------------------------------------
+ 
+def _storage_dir():
     """
-    Download approximately `days` most recent NSE trading sessions.
-
-    Existing local rows are retained. The newest calendar dates are checked
-    first, so pressing UPDATE NSE DATA actually looks for new market days.
-
-    Returns:
-        (rows, message)
+    Where the NSE CSV files are kept:
+      1. FLET_APP_STORAGE_DATA (set by Flet on Android / iOS)
+      2. an "nse_data" folder next to this file (Codespace / PC)
+      3. the system temp folder, if neither is writable
     """
-    clean_symbol = _symbol_clean(symbol)
-
-    try:
-        days = int(days)
-    except (TypeError, ValueError):
-        raise ValueError("Days must be an integer.")
-
-    if days < 1:
-        raise ValueError("Days must be at least 1.")
-    if days > 365:
-        days = 365
-
-    path = _local_filename(clean_symbol)
-    existing = _load_rows(path)
-    by_date = {r["date"]: r for r in existing}
-
-    today = date.today()
-
-    # Check recent dates first.  Around 2.8 calendar days per trading day
-    # normally covers weekends/holidays; the extra 10 days is a safety margin.
-    calendar_days = min(
-        MAX_CALENDAR_DAYS,
-        max(20, int(days * CALENDAR_MULTIPLIER) + 10),
+ 
+    candidates = []
+ 
+    flet_dir = os.environ.get("FLET_APP_STORAGE_DATA")
+ 
+    if flet_dir:
+        candidates.append(os.path.join(flet_dir, "nse_csv"))
+ 
+    candidates.append(
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "nse_data",
+        )
     )
-
-    checked = 0
-    downloaded = 0
-    missing = 0
-    blocked = 0
-
-    current = today
-    oldest_needed = today - timedelta(days=calendar_days - 1)
-
-    while current >= oldest_needed:
-        row, error = _download_one_day(clean_symbol, current)
-        checked += 1
-
-        if row is not None:
-            by_date[row["date"]] = row
-            downloaded += 1
-            time.sleep(DOWNLOAD_PAUSE_SECONDS)
-        else:
-            if error == "HTTP 403":
-                blocked += 1
-                break
-            missing += 1
-
-        # Once we have at least the requested number of recent rows,
-        # no older dates are needed for this update.
-        rows_now = sorted(by_date.values(), key=lambda r: r["date"])
-        if len(rows_now) >= days:
-            break
-
-        current -= timedelta(days=1)
-
-    rows = sorted(by_date.values(), key=lambda r: r["date"])
-    _save_rows(path, rows)
-
-    selected = rows[-days:] if len(rows) >= days else rows
-
-    if len(selected) < days:
-        if blocked:
-            raise RuntimeError(
-                f"NSE archive refused this connection with HTTP 403. "
-                f"I could not download {days} trading days automatically. "
-                f"Local data found: {len(selected)} days. "
-                f"Open NSE All Reports and download the "
-                f"'CM-UDiFF Common Bhavcopy Final (zip)' files, then "
-                f"place/convert the data into {path.name}."
-            )
-
-        raise RuntimeError(
-            f"NSE download completed only {len(selected)} usable trading "
-            f"days out of {days} requested. "
-            f"Checked {checked} calendar days and downloaded {downloaded} "
-            f"daily files."
-        )
-
-    return selected, (
-        f"NSE update successful: {len(selected)} trading days saved to "
-        f"{path.name}. New daily files downloaded: {downloaded}."
+ 
+    candidates.append(
+        os.path.join(tempfile.gettempdir(), "nse_csv")
     )
-
-def get_nse_history(symbol: str, days: int = 30):
+ 
+    for folder in candidates:
+        try:
+            os.makedirs(folder, exist_ok=True)
+ 
+            probe = os.path.join(folder, ".write_test")
+ 
+            with open(probe, "w") as f:
+                f.write("ok")
+ 
+            os.remove(probe)
+ 
+            return folder
+ 
+        except Exception:
+            continue
+ 
+    return tempfile.gettempdir()
+ 
+ 
+def csv_file_path(symbol):
+    return os.path.join(
+        _storage_dir(),
+        f"nse_{re.sub(r'[^A-Z0-9_-]', '_', symbol)}.csv",
+    )
+ 
+ 
+def _read_saved_csv(path):
+    """Returns (rows, age_seconds) or None."""
+ 
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+ 
+        rows = parse_nse_csv(text)
+ 
+        return rows, time.time() - os.path.getmtime(path)
+ 
+    except Exception:
+        return None
+ 
+ 
+def _save_csv(path, text):
+    """Returns True when the file was written."""
+ 
+    try:
+        tmp = path + ".tmp"
+ 
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+ 
+        os.replace(tmp, path)
+ 
+        return True
+ 
+    except Exception:
+        return False
+ 
+ 
+# ------------------------------------------------------------
+# download: nselib
+# ------------------------------------------------------------
+ 
+def _download_with_nselib(symbol, start, end):
     """
-    Return local NSE data if it already contains enough rows.
-    Otherwise update from NSE.
+    Uses nselib (import is lazy, so the app still starts when
+    nselib is not bundled in the APK). Returns CSV text.
     """
-    clean_symbol = _symbol_clean(symbol)
-    path = _local_filename(clean_symbol)
-    rows = _load_rows(path)
-
-    if len(rows) >= int(days):
-        return rows[-int(days):], "local NSE CSV"
-
-    rows, message = update_nse_history(clean_symbol, days)
-    return rows, message
-
-
-def load_saved_nse_history(symbol: str):
-    """Load whatever NSE history is already saved locally."""
-    clean_symbol = _symbol_clean(symbol)
-    return _load_rows(_local_filename(clean_symbol))
-
-
-def fetch_price_history_ex(
-    symbol: str,
-    days: int = 60,
-    timezone_name: str = "Asia/Kolkata",
-):
-    """
-    Compatibility function used by bhoovalaya_engine.py.
-
-    It deliberately uses NSE data only. Yahoo is not contacted.
-    """
-    rows, source = get_nse_history(symbol, days)
-    return rows, source
-
-
-def fetch_price_history(
-    symbol: str,
-    days: int = 60,
-    timezone_name: str = "Asia/Kolkata",
-):
-    rows, _source = fetch_price_history_ex(
+ 
+    from nselib import capital_market
+ 
+    df = capital_market.price_volume_data(
         symbol,
-        days=days,
-        timezone_name=timezone_name,
+        start.strftime(DMY),
+        end.strftime(DMY),
     )
-    return rows
-
-
-def get_last_close(symbol: str):
-    rows = load_saved_nse_history(symbol)
-    if not rows:
-        rows, _ = get_nse_history(symbol, 1)
-    return rows[-1]["close"]
-
-
-if __name__ == "__main__":
-    # Desktop/Codespaces test:
-    # python market_data.py
-    symbol = "RELIANCE.NS"
-    rows, message = update_nse_history(symbol, 30)
-    print(message)
-    print("First:", rows[0])
-    print("Last :", rows[-1])
-
-# ---------------------------------------------------------------------------
-# Compatibility functions for the existing main.py
-# ---------------------------------------------------------------------------
-# The existing Flet V5 main.py imports:
-#   get_stock_history
-#   update_stock_history
-#   get_cache_csv_path
-#
-# Keep these names so main.py does not have to be rewritten just because
-# the data source changed from Yahoo to NSE.
-
-def get_cache_csv_path(symbol: str):
-    """Return the local NSE CSV path used by this module."""
-    return str(_local_filename(symbol))
-
-
-def get_stock_history(symbol: str, days: int = 30):
+ 
+    if df is None or len(df) == 0:
+        raise ValueError("nselib returned no rows.")
+ 
+    return df.to_csv(index=False)
+ 
+ 
+# ------------------------------------------------------------
+# download: direct from NSE (standard library only)
+# ------------------------------------------------------------
+ 
+def _ssl_context():
     """
-    Existing main.py compatibility wrapper.
-
-    Returns only the historical rows, as before.
+    Android often has no system CA bundle that Python can see.
+    Use certifi when it is bundled, otherwise the default context.
     """
-    rows, _source = get_nse_history(symbol, days)
-    return rows
-
-
-def update_stock_history(symbol: str, days: int = 30):
+ 
+    try:
+        import certifi
+ 
+        return ssl.create_default_context(
+            cafile=certifi.where()
+        )
+ 
+    except Exception:
+        return ssl.create_default_context()
+ 
+ 
+def _nse_opener():
+    return urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(
+            http.cookiejar.CookieJar()
+        ),
+        urllib.request.HTTPSHandler(
+            context=_ssl_context()
+        ),
+    )
+ 
+ 
+def _read_body(response):
+ 
+    raw = response.read()
+ 
+    encoding = (
+        response.headers.get("Content-Encoding") or ""
+    ).lower()
+ 
+    if "gzip" in encoding:
+        raw = gzip.decompress(raw)
+ 
+    return raw.decode("utf-8-sig", errors="replace")
+ 
+ 
+def _nse_get(opener, url, headers):
+ 
+    request = urllib.request.Request(url, headers=headers)
+ 
+    with opener.open(request, timeout=25) as response:
+        return _read_body(response)
+ 
+ 
+def _download_direct_once(symbol, start, end):
+    """One full attempt: cookies first, then each <=1 year chunk."""
+ 
+    opener = _nse_opener()
+ 
+    # NSE only answers API calls that carry its site cookies.
+    _nse_get(opener, NSE_ORIGIN_URL, NSE_PAGE_HEADERS)
+ 
+    pieces = []
+ 
+    cursor = start
+ 
+    while cursor <= end:
+ 
+        chunk_end = min(
+            cursor + timedelta(days=NSE_MAX_CHUNK_DAYS),
+            end,
+        )
+ 
+        query = urllib.parse.urlencode(
+            {
+                "from": cursor.strftime(DMY),
+                "to": chunk_end.strftime(DMY),
+                "symbol": symbol,
+                "type": "priceVolume",
+                "series": "ALL",
+                "csv": "true",
+            }
+        )
+ 
+        body = _nse_get(
+            opener,
+            NSE_API_URL + query,
+            NSE_API_HEADERS,
+        )
+ 
+        head = body.lstrip()[:1]
+ 
+        if head in ("<", "{", "["):
+            raise ConnectionError(
+                "NSE did not send a CSV file "
+                "(it may be blocking this request)."
+            )
+ 
+        # Only the first piece keeps its header row.
+        lines = body.splitlines()
+ 
+        pieces.append(
+            "\n".join(lines if not pieces else lines[1:])
+        )
+ 
+        cursor = chunk_end + timedelta(days=1)
+ 
+        if cursor <= end:
+            time.sleep(1.0)
+ 
+    return "\n".join(pieces)
+ 
+ 
+def _download_direct(symbol, start, end):
+ 
+    last_error = "unknown error"
+ 
+    for attempt in range(FETCH_ATTEMPTS):
+ 
+        try:
+            text = _download_direct_once(symbol, start, end)
+ 
+            # Make sure it really is a usable price file.
+            parse_nse_csv(text)
+ 
+            return text
+ 
+        except ValueError:
+            # Readable answer from NSE (no rows, bad columns):
+            # retrying will not change it.
+            raise
+ 
+        except urllib.error.HTTPError as ex:
+            last_error = f"HTTP Error {ex.code}: {ex.reason}"
+ 
+            if ex.code not in RETRY_CODES:
+                raise ValueError(last_error)
+ 
+        except Exception as ex:
+            last_error = str(ex)
+ 
+        if attempt < FETCH_ATTEMPTS - 1:
+            time.sleep(
+                RETRY_PAUSE_SECONDS * (attempt + 1)
+            )
+ 
+    raise ValueError(last_error)
+ 
+ 
+# ------------------------------------------------------------
+# public API
+# ------------------------------------------------------------
+ 
+# Every download covers at least this many sessions, so one
+# "UPDATE NSE DATA" serves all the Test-days choices (30 ... 180).
+DOWNLOAD_SESSIONS = 180
+ 
+ 
+def _clamp_days(period_days):
+ 
+    try:
+        days = int(period_days)
+    except Exception:
+        days = 60
+ 
+    return max(MIN_DAYS, min(days, MAX_DAYS))
+ 
+ 
+def get_cache_csv_path(symbol):
+    """Path of the saved CSV for this symbol (may not exist yet)."""
+ 
+    return csv_file_path(normalize_nse_symbol(symbol))
+ 
+ 
+def _download_history(symbol, sessions):
     """
-    Existing main.py compatibility wrapper.
-
-    Downloads/updates NSE data and returns the rows.
+    Downloads about `sessions` trading sessions from NSE.
+    Returns (csv_text, rows, source). Raises ValueError.
+ 
+    source is "nselib" or "nse-direct".
     """
-    rows, _message = update_nse_history(symbol, days)
-    return rows
-
+ 
+    end = _india_today()
+ 
+    # Calendar days needed to cover `sessions` trading sessions.
+    start = end - timedelta(days=int(sessions * 7 / 5) + 12)
+ 
+    attempts = []
+ 
+    if USE_NSELIB:
+        attempts.append(("nselib", _download_with_nselib))
+ 
+    attempts.append(("nse-direct", _download_direct))
+ 
+    errors = []
+ 
+    for name, downloader in attempts:
+ 
+        try:
+            text = downloader(symbol, start, end)
+ 
+            rows = parse_nse_csv(text)
+ 
+            if len(rows) < MIN_DAYS:
+                raise ValueError(
+                    f"only {len(rows)} price rows found; "
+                    f"at least {MIN_DAYS} are needed"
+                )
+ 
+            return text, rows, name
+ 
+        except ImportError:
+            # nselib is not bundled in this build - not an error,
+            # the direct NSE download does the same job.
+            continue
+ 
+        except Exception as ex:
+            errors.append(f"{name}: {ex}")
+ 
+    raise ValueError(
+        f"Could not download NSE data for {symbol}. "
+        + " | ".join(errors)
+    )
+ 
+ 
+def update_stock_history(symbol, period_days=60):
+    """
+    Downloads fresh data from NSE and saves it as a CSV file.
+    Returns (rows, csv_path) with the last `period_days` sessions.
+    Raises an exception with a readable message on failure.
+    """
+ 
+    symbol = normalize_nse_symbol(symbol)
+ 
+    days = _clamp_days(period_days)
+ 
+    text, rows, _source = _download_history(
+        symbol,
+        max(days, DOWNLOAD_SESSIONS),
+    )
+ 
+    path = csv_file_path(symbol)
+ 
+    if not _save_csv(path, text):
+        raise ValueError(
+            f"Data was downloaded but the CSV file could not "
+            f"be saved to {path}."
+        )
+ 
+    return rows[-days:], path
+ 
+ 
+def get_stock_history(
+    symbol,
+    period_days=60,
+    force_refresh=False,
+):
+    """
+    Returns the last `period_days` sessions as
+    [{"date": datetime.date, "close": float}, ...].
+ 
+    Uses the saved CSV when it is less than 2 hours old and long
+    enough; otherwise downloads from NSE. If NSE cannot be reached
+    the last saved CSV is used, however old.
+    """
+ 
+    symbol = normalize_nse_symbol(symbol)
+ 
+    days = _clamp_days(period_days)
+ 
+    saved = _read_saved_csv(csv_file_path(symbol))
+ 
+    if (
+        not force_refresh
+        and saved
+        and saved[1] < CACHE_FRESH_SECONDS
+        and len(saved[0]) >= days
+    ):
+        return saved[0][-days:]
+ 
+    try:
+        rows, _path = update_stock_history(symbol, days)
+        return rows
+ 
+    except Exception:
+ 
+        if saved and len(saved[0]) >= MIN_DAYS:
+            return saved[0][-days:]
+ 
+        raise
+ 
